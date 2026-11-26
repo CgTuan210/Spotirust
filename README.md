@@ -6,21 +6,25 @@
 
 ---
 
-## Two Honest Operating Modes
+## Three Honest Operating Modes
 
-Spotirust strictly separates remote Spotify control from native local playback and **never** advances a fake progress bar or reports `Playing` without real audio or remote device confirmation:
+Spotirust strictly separates standalone headless Spotify playback, remote Spotify control, and native local playback — and **never** advances a fake progress bar or reports `Playing` without real audio or backend confirmation:
 
-1. **Spotify Connect Remote Controller (`📡 Connect`):**
-   - Controls an active external Spotify Connect device (official Spotify Desktop/Mobile app, hardware speaker, or **Spotify Soloist**) via official Spotify Web API `/me/player/*` endpoints.
-   - Distinguishes **Active**, **Available**, and **Restricted** devices; waits for `GET /me/player` confirmation before showing `Playing`; detects device disconnection mid-playback; and strictly enforces HTTP `429 Retry-After` cooldowns without API spam.
-   - **Requires Spotify Premium** and an active external Connect target (Spotify Web API does not stream audio bytes directly to third-party apps).
-2. **Local Music Player (`🎵 Local` — `rodio 0.21` + `lofty 0.25` + `rfd 0.18`):**
+1. **Spotify Soloist Built-in Headless Engine (`⚡ Soloist` — Recommended for Standalone Spotify):**
+   - Supervises Spotify's official headless **Spotify Soloist** engine locally (`soloist --ws 127.0.0.1:0`) with one-click official CDN download/update (never redistributing Spotify's proprietary binary), OS-keyring personal API key storage, and zero-polling real-time WebSocket playback & karaoke clock sync.
+   - Pair **once** from the official Spotify app on the same network, then **close the official Spotify app permanently** — Spotirust keeps playing full Spotify tracks natively on your computer.
+   - **Requires Spotify Premium** and your own personal Soloist API key (`https://developer.spotify.com/dashboard/soloist`). Automatically detects 90-day build expiry (exit code `10`).
+2. **Spotify Connect Remote Controller (`📡 Connect`):**
+   - Controls an active external Spotify Connect device (official Spotify Desktop/Mobile app, hardware speaker, or external Soloist instance) via official Spotify Web API `/me/player/*` endpoints.
+   - Automatically resolves an available non-restricted device from `/me/player/devices` if no active device is cached, distinguishes **Active**, **Available**, and **Restricted** devices, confirms state via `GET /me/player`, detects device disconnection mid-playback, and strictly enforces HTTP `429 Retry-After` cooldowns.
+   - **Requires Spotify Premium** and an active external Connect target.
+3. **Local Music Player (`🎵 Local` — `rodio 0.21` + `lofty 0.25` + `rfd 0.18`):**
    - Native OS **Select Folder** and **Add Files** pickers (`rfd`) plus manual path input fallback, non-blocking background recursive scanning, and explicit **Rescan**.
    - Real metadata & embedded cover artwork extraction via `lofty 0.25` (title, artist, album, duration, embedded cover art persisted as `localart://` thumbnails).
    - Persisted in SQLite (`schema v2`) with file size/mtime fingerprinting so startup loads instantly without rescanning folders every launch. Safely skips corrupt/truncated files.
    - Compiled `rodio`/`symphonia` decoders for **WAV** *(runtime-verified)*, **MP3**, **FLAC**, and **OGG Vorbis** *(decoders compiled; see [`PRODUCTION_READINESS.md`](PRODUCTION_READINESS.md))*, with Play All, Shuffle Play, Repeat, Queue persistence, and restart position restore.
    - Includes two locally synthesized royalty-free `.wav` Soundcheck tracks paired with bundled `.ttml` and Enhanced `.lrc` files for offline testing.
-3. **Optional Community `librespot 0.8` (`--features librespot-backend` — Currently Blocked):**
+4. **Optional Community `librespot 0.8` (`--features librespot-backend` — Currently Blocked):**
    - Compiles cleanly behind a feature flag (0 warnings), but starting **August 10, 2026** (`librespot-org/librespot#1737`), Spotify blocked third-party OAuth tokens on `login5`. Spotirust refuses to embed unauthorized first-party credentials.
 
 ---
@@ -63,7 +67,7 @@ Spotirust strictly separates remote Spotify control from native local playback a
 
 ## Quick Start (Without Installing Rust)
 
-Download or extract the Linux portable archive (`spotirust-linux-x86_64-portable.tar.gz`):
+Download or extract the portable archive (`spotirust-linux-x86_64-portable.tar.gz`, `spotirust-macos-arm64-portable.tar.gz`, or `spotirust-windows-x86_64-portable.zip`):
 
 ```bash
 tar -xzf spotirust-linux-x86_64-portable.tar.gz
@@ -71,7 +75,63 @@ cd spotirust
 ./spotirust
 ```
 
-Portable mode keeps all SQLite data, local library index, artwork cache, themes, and lyrics inside `./spotirust-data/`. See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for Linux runtime dependencies, standard XDG/macOS/Windows paths, and full uninstall/reset steps. *(Windows and macOS installers/archives are not yet verified on native Windows/macOS machines.)*
+Portable mode keeps all SQLite data, local library index, artwork cache, themes, lyrics, and managed Soloist data inside `./spotirust-data/`. See [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for Linux runtime dependencies, standard XDG/macOS/Windows paths, and full uninstall/reset steps. *(Windows and macOS installers/archives are built in CI and not yet verified on physical Windows/macOS machines.)*
+
+---
+
+## User Setup Guide (Playing Spotify & Self-Hosting)
+
+### What Do You Need?
+
+| Mode | Spotify Premium? | Spotify OAuth Client ID? | Personal Soloist API Key? | Keeps Official Spotify App Open? |
+|---|:---:|:---:|:---:|:---:|
+| **`🎵 Local`** *(MP3/FLAC/OGG/WAV + Karaoke)* | **No** | **No** | **No** | **No** |
+| **`⚡ Soloist`** *(Recommended for Spotify)* | **Yes** | **Yes** *(for browsing/search/library)* | **Yes** *(each user generates their own)* | **No** *(pair once, then close it permanently)* |
+| **`📡 Connect`** *(Remote Control)* | **Yes** | **Yes** | **No** | **Yes** *(or a Connect speaker)* |
+
+### Step 1 — Sign In to Spotify (For New Users / Self-Hosting)
+
+Under Spotify's 2026 Developer Policy, a Development Mode `client_id` is capped at **5 allowlisted users** (public unlimited apps require Extended Quota Mode: registered business + ≥ 250,000 MAU).
+
+- **If you are on the maintainer's allowlist** (or using an Extended Quota build): simply launch Spotirust and click **Login with Spotify**.
+- **If you are setting up Spotirust for yourself (takes ~2 minutes, no Rust required for prebuilt binaries):**
+  1. Open the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) *(requires an active Spotify Premium account)* and click **Create app**.
+  2. Add Redirect URI: `http://127.0.0.1/callback` *(do **not** use `localhost` — Spotify permanently banned `localhost` redirect URIs on Nov 27, 2025)*.
+     - *Optional fixed port:* use `http://127.0.0.1:43821/callback` and set `SPOTIRUST_REDIRECT_PORT=43821`.
+  3. Copy your app's **Client ID** *(Spotirust uses PKCE and never needs or stores your Client Secret)*.
+  4. Launch Spotirust with your Client ID via environment variable (overrides any baked-in default):
+     - **Linux / macOS:**
+       ```bash
+       SPOTIFY_CLIENT_ID="your_spotify_client_id" ./spotirust
+       ```
+     - **Windows (PowerShell):**
+       ```powershell
+       $env:SPOTIFY_CLIENT_ID = "your_spotify_client_id"
+       .\spotirust.exe
+       ```
+     - **Or bake it once when building from source:**
+       ```bash
+       SPOTIFY_CLIENT_ID="your_spotify_client_id" cargo build --release
+       ```
+  5. Click **Login with Spotify** inside Spotirust — your browser opens Spotify's official consent page and returns automatically to `127.0.0.1`. Your OAuth session is stored strictly in your OS credential vault (never in SQLite).
+
+### Step 2 — Set Up `⚡ Soloist` (Play Spotify Without Keeping the Official App Open)
+
+Because Spotify prohibits redistributing its proprietary Soloist binary or sharing Soloist API keys across users, each user completes this quick one-time setup inside Spotirust:
+
+1. Open **Settings → Spotify Soloist — Built-in Headless Engine**.
+2. **Personal Soloist API Key:** Click **Get Key on Spotify Dashboard ↗** ([`developer.spotify.com/dashboard/soloist`](https://developer.spotify.com/dashboard/soloist), requires **Spotify Premium**), generate/copy your personal key, paste it into Spotirust, and click **Save Key**.
+   - Stored strictly in your OS Keyring (`com.spotirust.desktop` / `spotify_soloist_api_key`), never written to SQLite or logs. *(You may also pass it via `SOLOIST_API_KEY` env var.)*
+3. **Install Official Soloist Binary:** Click **Download & Install Soloist** — Spotirust downloads the official build directly from Spotify's CDN (`soloist-builds.spotifycdn.com`), verifies its executable header, and installs it locally (or click **Browse Existing Binary…** if you downloaded it manually).
+   - *Official Soloist platforms:* Linux (`x86_64`, `aarch64`, `armv7`), macOS Apple Silicon (`arm64`), and Windows (`x86_64`). *(Intel macOS users can use `📡 Connect` or `🎵 Local`.)*
+4. **One-Time Pairing:** Click **Start Soloist**. Open the official Spotify app (phone or PC on the same Wi-Fi) **once**, open **Connect to a device**, and select **`Spotirust`**.
+5. Once Spotirust shows **`● Connected & Paired`**, you can **close the official Spotify app permanently**. On future launches, Spotirust auto-starts Soloist in the background (`--ws 127.0.0.1:0`) and plays full Spotify tracks directly with zero-polling karaoke sync.
+   - **90-Day Build Updates:** Official Soloist builds expire after 90 days (`exit code 10`). Spotirust detects this automatically and shows a one-click **Update Soloist** button without losing your paired session.
+
+### Alternative — Using `📡 Connect` or `🎵 Local` Only
+
+- **`📡 Connect`:** Keep the official Spotify app or a Connect speaker open, switch the top-bar pill to **`📡 Connect`**, and play any track. Spotirust automatically discovers an available non-restricted device via `/me/player/devices` (or pick a device from the **🔊 Connect Devices** menu).
+- **`🎵 Local`:** Switch to **`🎵 Local`**, open **Local Files**, add a music folder (`MP3`, `FLAC`, `OGG`, `WAV`), and play offline with word-by-word karaoke lyrics — no Spotify account required.
 
 ---
 
@@ -91,7 +151,7 @@ Portable mode keeps all SQLite data, local library index, artwork cache, themes,
 ### Build, Run & Package
 
 ```bash
-# Default build (Native GUI + Spotify Web API + Local Rodio/Lofty/RFD + Lyrics + Linux MPRIS2)
+# Default build (Native GUI + Spotify Web API + Soloist + Local Rodio/Lofty/RFD + Lyrics + Linux MPRIS2)
 cargo build --release
 
 # Optional: include feature-gated librespot 0.8 module (see blocked status in PRODUCTION_READINESS.md)
@@ -100,7 +160,7 @@ cargo build --release --features librespot-backend
 # Launch desktop GUI (or add `-- --portable`)
 cargo run --release
 
-# Run headless parser, SQLite v2 & KaraokeLayoutCache micro-benchmarks
+# Run headless parser, SQLite v3 & KaraokeLayoutCache micro-benchmarks
 cargo run --release -- --diagnostics
 
 # Build Linux portable archive (target/portable/spotirust-linux-x86_64-portable.tar.gz)
@@ -109,19 +169,11 @@ cargo run --release -- --diagnostics
 
 ---
 
-## Spotify OAuth Configuration & 2026 Development Mode Limits (Maintainers)
+## Maintainer Notes: Spotify 2026 Development Mode Limits
 
-Spotify requires a registered OAuth `client_id` for PKCE. Spotirust intentionally does **not** display a Client ID input box to end users and **never** embeds a Client Secret.
-
-Under Spotify's February–July 2026 Developer Policy, Development Mode requires an active **Spotify Premium** account for the app owner and caps each Client ID at **5 allowlisted test users** (`/search` `limit <= 10`, owned/collaborated playlist items only). Public unlimited distribution requires **Extended Quota Mode** (registered organization, ≥ 250,000 MAU). For personal/team builds:
-
-1. Create an app in the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard).
-2. Add Redirect URI `http://127.0.0.1/callback` (`localhost` is banned since Nov 2025), or fixed port `http://127.0.0.1:43821/callback` with `SPOTIRUST_REDIRECT_PORT=43821`.
-3. Add up to 5 test accounts under **User Management**.
-4. Bake the public Client ID once at build time:
-   ```bash
-   SPOTIRUST_CLIENT_ID="your_public_spotify_client_id" cargo build --release
-   ```
+- Spotirust intentionally does **not** display a Client ID input box in the end-user GUI and **never** embeds a Client Secret.
+- Maintainers can bake a default public Client ID at compile time with `SPOTIRUST_CLIENT_ID="..." cargo build --release` (or leave it unset in public CI artifacts so each self-hosted user passes their own `SPOTIFY_CLIENT_ID` at launch).
+- In Development Mode, Spotify limits each Client ID to **5 allowlisted accounts** under **User Management**, caps `/search` at `limit <= 10`, and restricts `/playlists/{id}/items` to owned/collaborated playlists.
 
 ---
 

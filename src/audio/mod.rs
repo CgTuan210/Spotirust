@@ -10,3 +10,4 @@ pub mod librespot_engine;
 pub mod local_rodio;
 pub mod playback;
 pub mod queue;
+pub mod soloist;

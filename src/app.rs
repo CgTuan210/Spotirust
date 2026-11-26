@@ -8,10 +8,11 @@ use crate::audio::local_rodio::{
     LocalScanReport, import_local_files_into_db, scan_local_library_into_db,
 };
 use crate::audio::playback::PlaybackController;
+use crate::audio::soloist::{SoloistEngine, SoloistEvent};
 use crate::auth::session::SessionManager;
 use crate::core::config::AppConfig;
 use crate::core::events::{AppCommand, AppEvent};
-use crate::core::models::Route;
+use crate::core::models::{AudioBackendKind, Route};
 use crate::core::plugins::{BuiltinSessionMetricsPlugin, PluginManifest, PluginRegistry};
 use crate::core::state::{AppState, AuthUiState, LyricsUiState, SideDrawer};
 use crate::lyrics::cache::LyricsCache;
@@ -42,6 +43,7 @@ pub struct SpotirustApp {
     cmd_tx: mpsc::UnboundedSender<AppCommand>,
     evt_rx: mpsc::UnboundedReceiver<AppEvent>,
     db: Database,
+    soloist: SoloistEngine,
     credential_backend: String,
     cached_stats: CacheStats,
     plugin_manifests: Vec<PluginManifest>,
@@ -106,11 +108,21 @@ impl SpotirustApp {
 
         let spotify_client = SpotifyClient::new(session.clone());
         let event_bus = PlaybackEventBus::default();
-        let playback = PlaybackController::new(
+        let soloist = SoloistEngine::new(
+            config.soloist_bin_dir.clone(),
+            config.soloist_data_dir.clone(),
+            config.soloist_cache_dir.clone(),
+        );
+        let playback = PlaybackController::with_soloist(
             Some(spotify_client.clone()),
             Some(db.clone()),
             event_bus.clone(),
+            soloist.clone(),
         );
+
+        let initial_soloist_key = crate::storage::credentials::load_soloist_api_key()
+            .or_else(crate::audio::soloist::resolve_env_soloist_key);
+        state.soloist.api_key_configured = initial_soloist_key.is_some();
 
         let default_lyrics_dir = config.lyrics_dir.clone();
         let mut lyrics_dirs = vec![default_lyrics_dir.clone()];
@@ -143,6 +155,10 @@ impl SpotirustApp {
             default_lyrics_dir,
             config.cache_dir.clone(),
             config.artwork_cache_dir.clone(),
+            initial_soloist_key,
+            settings.soloist_device_name.clone(),
+            settings.soloist_custom_binary_path.clone(),
+            settings.soloist_auto_start,
         );
 
         Ok(Self {
@@ -153,6 +169,7 @@ impl SpotirustApp {
             cmd_tx,
             evt_rx,
             db,
+            soloist,
             credential_backend,
             cached_stats,
             plugin_manifests,
@@ -394,6 +411,22 @@ impl SpotirustApp {
                         });
                     }
                 }
+                AppEvent::SoloistStatusUpdated(snap) => {
+                    let newly_paired = !self.state.soloist.logged_in && snap.logged_in;
+                    self.state.soloist = snap;
+                    if newly_paired {
+                        self.state.set_notice(
+                            format!(
+                                "Spotify Soloist '{}' paired & ready! You can now close the official Spotify app.",
+                                self.state.soloist.device_name
+                            ),
+                            false,
+                        );
+                    }
+                }
+                AppEvent::SoloistCustomBinaryUpdated(path) => {
+                    self.state.settings.soloist_custom_binary_path = path;
+                }
                 AppEvent::QueueUpdated {
                     items,
                     current_index,
@@ -520,6 +553,7 @@ impl SpotirustApp {
                     self.state.musixmatch_key_configured =
                         crate::lyrics::musixmatch::resolve_env_musixmatch_key().is_some();
                     self.state.musixmatch_key_input.clear();
+                    self.state.soloist_key_input.clear();
                     self.theme_mgr.set_active(&self.state.settings.theme_id);
                     self.theme_mgr.active().apply_to_egui(ctx);
                     self.cached_stats = self.db.cache_stats().unwrap_or_default();
@@ -549,6 +583,17 @@ impl SpotirustApp {
                         std::thread::spawn(move || {
                             if let Err(err) = open::that(&url) {
                                 tracing::warn!(error = %err, "Failed opening Spotify login URL in browser");
+                            }
+                        });
+                    }
+                    continue;
+                }
+                AppCommand::OpenExternalUrl { url } => {
+                    if url.starts_with("https://") {
+                        let url_owned = url.clone();
+                        std::thread::spawn(move || {
+                            if let Err(err) = open::that(&url_owned) {
+                                tracing::warn!(error = %err, "Failed opening external URL in browser");
                             }
                         });
                     }
@@ -900,6 +945,9 @@ impl eframe::App for SpotirustApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Gracefully terminate any managed Spotify Soloist child daemon so no orphan remains
+        self.soloist.stop_blocking();
+
         // Persist live playback position, track, and queue on exit so restart resumes cleanly
         let prefs = PlaybackPreferences {
             volume: self.state.playback.volume,
@@ -934,12 +982,18 @@ fn spawn_backend_coordinator(
     default_lyrics_dir: PathBuf,
     cache_dir: PathBuf,
     artwork_cache_dir: PathBuf,
+    initial_soloist_key: Option<String>,
+    initial_soloist_device_name: String,
+    initial_soloist_custom_binary: Option<PathBuf>,
+    initial_soloist_auto_start: bool,
 ) {
     let library_svc = LibraryService::new(spotify_client.clone());
     let playlist_svc = PlaylistService::new(spotify_client.clone());
     let search_svc = SearchService::new(spotify_client.clone());
     let auth_service =
         crate::auth::service::SpotifyAuthService::new(session.clone(), library_svc.clone());
+    let soloist = playback.soloist().clone();
+    let shared_http = session.http_client();
 
     let notify_ui = {
         let tx = evt_tx.clone();
@@ -956,6 +1010,22 @@ fn spawn_backend_coordinator(
         let _enter = runtime.enter();
         SystemMediaBridge::start(media_cmd_tx, artwork_cache_dir.clone(), None)
     };
+    {
+        let _enter = runtime.enter();
+        std::mem::drop(playback.spawn_soloist_event_listener());
+    }
+    // 0b. Forward Spotify Soloist runtime status updates directly to the UI thread
+    {
+        let mut sol_rx = soloist.subscribe();
+        let notify = notify_ui.clone();
+        runtime.spawn(async move {
+            while let Ok(evt) = sol_rx.recv().await {
+                if let SoloistEvent::RuntimeChanged(snap) = evt {
+                    notify(AppEvent::SoloistStatusUpdated(snap));
+                }
+            }
+        });
+    }
     {
         let pb = playback.clone();
         runtime.spawn(async move {
@@ -1056,15 +1126,19 @@ fn spawn_backend_coordinator(
         });
     }
 
-    // 3. Startup Soundcheck WAV preparation, session restoration & OS media status report
+    // 3. Startup Soundcheck WAV preparation, Soloist auto-probe/start, session restoration & OS media status
     //    (Local music library is already loaded instantly from SQLite — no full disk rescan on boot!)
     {
         let auth_boot = auth_service.clone();
         let db_boot = db.clone();
         let pb_boot = playback.clone();
+        let sol_boot = soloist.clone();
         let notify = notify_ui.clone();
         let wav_cache_dir = cache_dir.clone();
         let media_boot = media_bridge.clone();
+        let boot_sol_key = initial_soloist_key.clone();
+        let boot_sol_name = initial_soloist_device_name.clone();
+        let boot_sol_bin = initial_soloist_custom_binary.clone();
         runtime.spawn(async move {
             // Prepare real royalty-free WAV Soundcheck files asynchronously (zero startup stall)
             let _ = tokio::task::spawn_blocking(move || {
@@ -1079,6 +1153,21 @@ fn spawn_backend_coordinator(
             let snap = pb_boot.snapshot().await;
             media_boot.update_snapshot(&snap);
             notify(AppEvent::PlaybackUpdated(snap));
+
+            // Probe installed Spotify Soloist binary & auto-start when configured
+            let sol_snap = sol_boot
+                .refresh_installation_status(
+                    boot_sol_bin.as_deref(),
+                    &boot_sol_name,
+                    boot_sol_key.is_some(),
+                )
+                .await;
+            if initial_soloist_auto_start
+                && let (Some(bin), Some(key)) = (sol_snap.binary_path, boot_sol_key)
+                && let Err(err) = sol_boot.start_managed(bin, boot_sol_name, key).await
+            {
+                tracing::warn!(error = %err, "Failed auto-starting Spotify Soloist on boot");
+            }
 
             // Report OS media controls status once D-Bus/platform initialization settles
             tokio::time::sleep(Duration::from_millis(120)).await;
@@ -1141,6 +1230,9 @@ fn spawn_backend_coordinator(
         let mut lyrics_source = initial_lyrics_source;
         let mut chain_config = initial_chain_config;
         let mut music_dirs = initial_music_dirs;
+        let mut soloist_api_key = initial_soloist_key;
+        let mut soloist_device_name = initial_soloist_device_name;
+        let mut soloist_custom_binary = initial_soloist_custom_binary;
         let mut active_auth_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut active_lyrics_task: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -1355,26 +1447,46 @@ fn spawn_backend_coordinator(
                     let lib = library_svc.clone();
                     let notify = notify_ui.clone();
                     tokio::spawn(async move {
-                        if let Ok(devices) = lib.available_devices().await {
-                            notify(AppEvent::DevicesLoaded(devices));
+                        match lib.available_devices().await {
+                            Ok(devices) => notify(AppEvent::DevicesLoaded(devices)),
+                            Err(err) => notify(AppEvent::StatusBanner {
+                                message: format!("Failed refreshing Spotify Connect devices: {err}"),
+                                is_error: true,
+                            }),
                         }
                     });
                 }
                 AppCommand::SyncConnectState => {
                     let pb = playback.clone();
+                    let notify = notify_ui.clone();
                     tokio::spawn(async move {
-                        let _ = pb.sync_connect_now().await;
+                        if let Err(err) = pb.sync_connect_now().await
+                            && !matches!(err, crate::audio::engine::AudioError::Unauthenticated)
+                        {
+                            notify(AppEvent::StatusBanner {
+                                message: format!("Spotify Connect sync failed: {err}"),
+                                is_error: true,
+                            });
+                        }
                     });
                 }
                 AppCommand::TransferDevice { device_id } => {
                     let pb = playback.clone();
+                    let lib = library_svc.clone();
                     let notify = notify_ui.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = pb.transfer_connect_device(&device_id).await {
-                            notify(AppEvent::StatusBanner {
-                                message: format!("Device transfer failed: {err}"),
-                                is_error: true,
-                            });
+                        match pb.transfer_connect_device(&device_id).await {
+                            Ok(()) => {
+                                if let Ok(devices) = lib.available_devices().await {
+                                    notify(AppEvent::DevicesLoaded(devices));
+                                }
+                            }
+                            Err(err) => {
+                                notify(AppEvent::StatusBanner {
+                                    message: format!("Device transfer failed: {err}"),
+                                    is_error: true,
+                                });
+                            }
                         }
                     });
                 }
@@ -1464,8 +1576,35 @@ fn spawn_backend_coordinator(
                 }
                 AppCommand::SwitchAudioBackend { backend } => {
                     let pb = playback.clone();
+                    let lib = library_svc.clone();
+                    let sol = soloist.clone();
+                    let notify = notify_ui.clone();
+                    let key_opt = soloist_api_key.clone();
+                    let dev_name = soloist_device_name.clone();
+                    let custom_bin = soloist_custom_binary.clone();
+                    let is_auth = session.is_authenticated().await;
                     tokio::spawn(async move {
                         pb.set_preferred_backend(backend).await;
+                        if backend == AudioBackendKind::SpotifyConnect && is_auth {
+                            if let Ok(devices) = lib.available_devices().await {
+                                notify(AppEvent::DevicesLoaded(devices));
+                            }
+                        } else if backend == AudioBackendKind::SpotifySoloist {
+                            let snap = sol.runtime_snapshot().await;
+                            if !snap.status.is_running()
+                                && let Some(key) = key_opt
+                                && let Some(bin) = crate::audio::soloist::find_soloist_binary(
+                                    custom_bin.as_deref(),
+                                    sol.bin_dir(),
+                                )
+                                && let Err(err) = sol.start_managed(bin, dev_name, key).await
+                            {
+                                notify(AppEvent::StatusBanner {
+                                    message: format!("Could not start Spotify Soloist: {err}"),
+                                    is_error: true,
+                                });
+                            }
+                        }
                     });
                 }
                 AppCommand::PickLocalMusicFolder => {
@@ -1782,6 +1921,12 @@ fn spawn_backend_coordinator(
                     lyrics_source = settings.lyrics_source;
                     chain_config = settings.lyrics_chain_config();
                     music_dirs = settings.local_music_dirs.clone();
+                    soloist_device_name = if settings.soloist_device_name.trim().is_empty() {
+                        "Spotirust".to_string()
+                    } else {
+                        settings.soloist_device_name.trim().to_string()
+                    };
+                    soloist_custom_binary = settings.soloist_custom_binary_path.clone();
                     // Preserve default Spotirust lyrics directory alongside user-configured dirs
                     let mut dirs = vec![default_lyrics_dir.clone()];
                     for dir in &settings.local_lyrics_dirs {
@@ -1792,6 +1937,15 @@ fn spawn_backend_coordinator(
                     lyrics_service.update_local_dirs(dirs);
                     lyrics_service.update_chain_config(chain_config.clone());
                     let _ = db.save_settings(&settings);
+                    let sol = soloist.clone();
+                    let dev = soloist_device_name.clone();
+                    let bin = soloist_custom_binary.clone();
+                    let has_key = soloist_api_key.is_some();
+                    tokio::spawn(async move {
+                        let _ = sol
+                            .refresh_installation_status(bin.as_deref(), &dev, has_key)
+                            .await;
+                    });
                 }
                 AppCommand::SaveMusixmatchApiKey { api_key } => {
                     match api_key {
@@ -1830,6 +1984,261 @@ fn spawn_backend_coordinator(
                         }
                     }
                 }
+                AppCommand::SaveSoloistApiKey { api_key } => {
+                    match api_key {
+                        Some(key) if !key.trim().is_empty() => {
+                            let trimmed = key.trim().to_string();
+                            let vault_res =
+                                crate::storage::credentials::save_soloist_api_key(&trimmed);
+                            soloist_api_key = Some(trimmed.clone());
+                            let msg = match vault_res {
+                                Ok(()) => {
+                                    "Spotify Soloist API key saved to OS credential vault."
+                                        .to_string()
+                                }
+                                Err(err) => format!(
+                                    "Spotify Soloist API key active for this session (OS vault unavailable: {err})."
+                                ),
+                            };
+                            notify_ui(AppEvent::StatusBanner {
+                                message: msg,
+                                is_error: false,
+                            });
+
+                            let sol = soloist.clone();
+                            let dev = soloist_device_name.clone();
+                            let custom_bin = soloist_custom_binary.clone();
+                            let notify = notify_ui.clone();
+                            tokio::spawn(async move {
+                                let existing_bin = sol.runtime_snapshot().await.binary_path;
+                                let snap = sol
+                                    .refresh_installation_status(
+                                        custom_bin.as_deref().or(existing_bin.as_deref()),
+                                        &dev,
+                                        true,
+                                    )
+                                    .await;
+                                if let Some(bin) = snap.binary_path
+                                    && !snap.status.is_running()
+                                    && let Err(err) = sol.start_managed(bin, dev, trimmed).await
+                                {
+                                    notify(AppEvent::StatusBanner {
+                                        message: format!("Could not start Soloist: {err}"),
+                                        is_error: true,
+                                    });
+                                }
+                            });
+                        }
+                        _ => {
+                            let _ = crate::storage::credentials::delete_soloist_api_key();
+                            soloist_api_key = crate::audio::soloist::resolve_env_soloist_key();
+                            soloist.stop().await;
+                            let _ = soloist
+                                .refresh_installation_status(
+                                    soloist_custom_binary.as_deref(),
+                                    &soloist_device_name,
+                                    soloist_api_key.is_some(),
+                                )
+                                .await;
+                            notify_ui(AppEvent::StatusBanner {
+                                message: "Spotify Soloist API key removed from OS credential vault."
+                                    .to_string(),
+                                is_error: false,
+                            });
+                        }
+                    }
+                }
+                AppCommand::DownloadSoloist => {
+                    let sol = soloist.clone();
+                    let http = shared_http.clone();
+                    let notify = notify_ui.clone();
+                    let dev = soloist_device_name.clone();
+                    let key_opt = soloist_api_key.clone();
+                    let pb = playback.clone();
+                    let db_c = db.clone();
+                    // Clear custom override when user explicitly installs the managed official build
+                    soloist_custom_binary = None;
+                    tokio::spawn(async move {
+                        sol.stop().await;
+                        sol.set_downloading(true).await;
+                        match crate::audio::soloist::download_and_install_soloist(
+                            &http,
+                            sol.bin_dir(),
+                        )
+                        .await
+                        {
+                            Ok(info) => {
+                                if let Ok(mut settings) = db_c.load_settings() {
+                                    settings.soloist_custom_binary_path = None;
+                                    let _ = db_c.save_settings(&settings);
+                                }
+                                notify(AppEvent::SoloistCustomBinaryUpdated(None));
+                                sol.set_downloading(false).await;
+                                let _ = sol
+                                    .refresh_installation_status(None, &dev, key_opt.is_some())
+                                    .await;
+                                let ver_text = info
+                                    .version_output
+                                    .as_deref()
+                                    .unwrap_or("installed");
+                                notify(AppEvent::StatusBanner {
+                                    message: format!("Spotify Soloist installed ({ver_text})."),
+                                    is_error: false,
+                                });
+                                if let Some(key) = key_opt {
+                                    pb.set_preferred_backend(AudioBackendKind::SpotifySoloist)
+                                        .await;
+                                    if let Err(err) =
+                                        sol.start_managed(info.path, dev, key).await
+                                    {
+                                        sol.set_error_status(err.to_string()).await;
+                                        notify(AppEvent::StatusBanner {
+                                            message: format!("Soloist failed to start: {err}"),
+                                            is_error: true,
+                                        });
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                sol.set_error_status(err.clone()).await;
+                                notify(AppEvent::StatusBanner {
+                                    message: format!("Spotify Soloist download failed: {err}"),
+                                    is_error: true,
+                                });
+                            }
+                        }
+                    });
+                }
+                AppCommand::PickSoloistBinary => {
+                    let sol = soloist.clone();
+                    let db_c = db.clone();
+                    let notify = notify_ui.clone();
+                    let dev = soloist_device_name.clone();
+                    let has_key = soloist_api_key.is_some();
+                    tokio::spawn(async move {
+                        let picked = rfd::AsyncFileDialog::new()
+                            .set_title("Select Spotify Soloist Executable (soloist / soloist.exe)")
+                            .pick_file()
+                            .await;
+                        let Some(handle) = picked else {
+                            return;
+                        };
+                        let path = handle.path().to_path_buf();
+                        match crate::audio::soloist::probe_soloist_version(&path).await {
+                            Ok(ver) => {
+                                if let Ok(mut settings) = db_c.load_settings() {
+                                    settings.soloist_custom_binary_path = Some(path.clone());
+                                    let _ = db_c.save_settings(&settings);
+                                }
+                                notify(AppEvent::SoloistCustomBinaryUpdated(Some(path.clone())));
+                                let _ = sol
+                                    .refresh_installation_status(Some(&path), &dev, has_key)
+                                    .await;
+                                notify(AppEvent::StatusBanner {
+                                    message: format!("Selected Spotify Soloist binary ({ver})."),
+                                    is_error: false,
+                                });
+                            }
+                            Err(err) => {
+                                notify(AppEvent::StatusBanner {
+                                    message: format!("Selected file is not a valid Soloist binary: {err}"),
+                                    is_error: true,
+                                });
+                            }
+                        }
+                    });
+                }
+                AppCommand::StartSoloist | AppCommand::RestartSoloist => {
+                    let sol = soloist.clone();
+                    let pb = playback.clone();
+                    let notify = notify_ui.clone();
+                    let key_opt = soloist_api_key.clone();
+                    let dev = soloist_device_name.clone();
+                    let custom_bin = soloist_custom_binary.clone();
+                    tokio::spawn(async move {
+                        let Some(key) = key_opt else {
+                            notify(AppEvent::StatusBanner {
+                                message: "Enter & save your Spotify Soloist API key first (Settings → Spotify Soloist)."
+                                    .to_string(),
+                                is_error: true,
+                            });
+                            return;
+                        };
+                        let snap_bin = sol.runtime_snapshot().await.binary_path;
+                        let Some(bin) = snap_bin.or_else(|| {
+                            crate::audio::soloist::find_soloist_binary(
+                                custom_bin.as_deref(),
+                                sol.bin_dir(),
+                            )
+                        }) else {
+                            notify(AppEvent::StatusBanner {
+                                message: "Spotify Soloist binary is not installed yet. Click 'Download / Update Soloist' first."
+                                    .to_string(),
+                                is_error: true,
+                            });
+                            return;
+                        };
+                        pb.set_preferred_backend(AudioBackendKind::SpotifySoloist)
+                            .await;
+                        if let Err(err) = sol.start_managed(bin, dev, key).await {
+                            sol.set_error_status(err.to_string()).await;
+                            notify(AppEvent::StatusBanner {
+                                message: format!("Failed starting Spotify Soloist: {err}"),
+                                is_error: true,
+                            });
+                        }
+                    });
+                }
+                AppCommand::StopSoloist => {
+                    let sol = soloist.clone();
+                    let notify = notify_ui.clone();
+                    tokio::spawn(async move {
+                        sol.stop().await;
+                        notify(AppEvent::StatusBanner {
+                            message: "Spotify Soloist daemon stopped.".to_string(),
+                            is_error: false,
+                        });
+                    });
+                }
+                AppCommand::ResetSoloistPairing => {
+                    let sol = soloist.clone();
+                    let notify = notify_ui.clone();
+                    let key_opt = soloist_api_key.clone();
+                    let dev = soloist_device_name.clone();
+                    let custom_bin = soloist_custom_binary.clone();
+                    tokio::spawn(async move {
+                        let snap_bin = sol.runtime_snapshot().await.binary_path;
+                        match sol.reset_pairing_session().await {
+                            Ok(()) => {
+                                let bin_opt = snap_bin.or_else(|| {
+                                    crate::audio::soloist::find_soloist_binary(
+                                        custom_bin.as_deref(),
+                                        sol.bin_dir(),
+                                    )
+                                });
+                                if let (Some(key), Some(bin)) = (key_opt, bin_opt) {
+                                    let _ = sol.start_managed(bin, dev.clone(), key).await;
+                                    notify(AppEvent::StatusBanner {
+                                        message: format!(
+                                            "Soloist pairing cleared. Select '{dev}' in the Spotify app to pair again."
+                                        ),
+                                        is_error: false,
+                                    });
+                                } else {
+                                    notify(AppEvent::StatusBanner {
+                                        message: "Soloist stored pairing session cleared."
+                                            .to_string(),
+                                        is_error: false,
+                                    });
+                                }
+                            }
+                            Err(err) => notify(AppEvent::StatusBanner {
+                                message: format!("Failed clearing Soloist pairing: {err}"),
+                                is_error: true,
+                            }),
+                        }
+                    });
+                }
                 AppCommand::ClearCache => {
                     let db_removed = db.clear_cache().unwrap_or(0);
                     let disk_removed = artwork_service.clear_remote_disk_cache().unwrap_or(0);
@@ -1848,6 +2257,18 @@ fn spawn_backend_coordinator(
                     }
                     music_dirs.clear();
                     let _ = crate::storage::credentials::delete_musixmatch_api_key();
+                    let _ = crate::storage::credentials::delete_soloist_api_key();
+                    soloist_api_key = crate::audio::soloist::resolve_env_soloist_key();
+                    soloist_device_name = "Spotirust".to_string();
+                    soloist_custom_binary = None;
+                    let _ = soloist.reset_pairing_session().await;
+                    let _ = soloist
+                        .refresh_installation_status(
+                            None,
+                            &soloist_device_name,
+                            soloist_api_key.is_some(),
+                        )
+                        .await;
                     lyrics_service
                         .set_musixmatch_api_key(crate::lyrics::musixmatch::resolve_env_musixmatch_key());
                     chain_config = Default::default();
@@ -1861,7 +2282,7 @@ fn spawn_backend_coordinator(
                     playback.clear_queue().await;
                     notify_ui(AppEvent::ApplicationReset);
                 }
-                AppCommand::OpenPendingLoginUrl => {}
+                AppCommand::OpenPendingLoginUrl | AppCommand::OpenExternalUrl { .. } => {}
             }
         }
     });

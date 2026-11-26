@@ -181,6 +181,8 @@ pub struct AppState {
     pub import_lyrics_path: String,
     pub musixmatch_key_configured: bool,
     pub musixmatch_key_input: String,
+    pub soloist: crate::audio::soloist::SoloistRuntimeSnapshot,
+    pub soloist_key_input: String,
 
     // Notifications
     pub notice: Option<StatusNotice>,
@@ -189,6 +191,10 @@ pub struct AppState {
 impl AppState {
     pub fn new(settings: UserSettings, client_id_configured: bool, portable_mode: bool) -> Self {
         let showcase_tracks = bundled_showcase_tracks();
+        let mut soloist = crate::audio::soloist::SoloistRuntimeSnapshot::default();
+        if !settings.soloist_device_name.trim().is_empty() {
+            soloist.device_name = settings.soloist_device_name.clone();
+        }
         Self {
             current_route: Route::Home,
             back_stack: Vec::new(),
@@ -240,6 +246,8 @@ impl AppState {
             import_lyrics_path: String::new(),
             musixmatch_key_configured: false,
             musixmatch_key_input: String::new(),
+            soloist,
+            soloist_key_input: String::new(),
             notice: None,
         }
     }

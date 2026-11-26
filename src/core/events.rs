@@ -114,6 +114,18 @@ pub enum AppCommand {
     SaveMusixmatchApiKey {
         api_key: Option<String>,
     },
+    SaveSoloistApiKey {
+        api_key: Option<String>,
+    },
+    DownloadSoloist,
+    PickSoloistBinary,
+    StartSoloist,
+    StopSoloist,
+    RestartSoloist,
+    ResetSoloistPairing,
+    OpenExternalUrl {
+        url: String,
+    },
     ClearCache,
     ResetApplication,
 }
@@ -188,6 +200,8 @@ pub enum AppEvent {
 
     // Playback updates
     PlaybackUpdated(PlaybackSnapshot),
+    SoloistStatusUpdated(crate::audio::soloist::SoloistRuntimeSnapshot),
+    SoloistCustomBinaryUpdated(Option<PathBuf>),
     QueueUpdated {
         items: Vec<Track>,
         current_index: Option<usize>,

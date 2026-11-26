@@ -69,7 +69,17 @@ Spotify requires a registered OAuth Client ID even for Authorization Code Flow w
    - Recommended (dynamic port): `http://127.0.0.1/callback`
    - Or fixed port: `http://127.0.0.1:43821/callback` (and set `SPOTIRUST_REDIRECT_PORT=43821`).
    - **Important:** Do **not** use `http://localhost:...` — Spotify permanently banned `localhost` redirect URIs on November 27, 2025.
-3. Build or run with your Client ID:
+3. Launch a prebuilt binary directly with your Client ID (no Rust required; overrides any compile-time default):
+   ```bash
+   # Linux / macOS
+   SPOTIFY_CLIENT_ID="your_spotify_client_id" ./spotirust
+   ```
+   ```powershell
+   # Windows (PowerShell)
+   $env:SPOTIFY_CLIENT_ID = "your_spotify_client_id"
+   .\spotirust.exe
+   ```
+   Or bake it once when building from source:
    ```bash
    SPOTIRUST_CLIENT_ID="your_spotify_client_id" cargo build --release
    ```
@@ -92,18 +102,23 @@ Spotify restricts `/me/player/*` remote playback control to **Spotify Premium** 
 
 ### "No active Spotify Connect playback device found"
 The official Spotify Web API Connect backend controls an active Connect receiver rather than streaming audio bytes directly:
-1. Open the official Spotify desktop/mobile app, a Connect speaker, or **Spotify Soloist** (Spotify's official headless Connect receiver).
-2. In Spotirust's top bar, open **Connect Devices → Sync Active Playback & Devices** and select an available (non-restricted) device.
-3. Devices marked `⊘ Restricted` by Spotify cannot be controlled via the Web API.
+1. For standalone playback **without keeping the official Spotify app open**, enable **Spotify Soloist** (below) in **Settings → Spotify Soloist — Built-in Headless Engine**.
+2. Or open the official Spotify desktop/mobile app or a hardware Connect speaker.
+3. In Spotirust's top bar, open **Connect Devices → Sync Active Playback & Devices** and select an available (non-restricted) device. Spotirust also automatically resolves an available non-restricted device from `/me/player/devices` if no active device is cached yet.
+4. Devices marked `⊘ Restricted` by Spotify cannot be controlled via the Web API.
 
-### About Spotify Soloist
-Spotify Soloist (`spotify-soloist`) is Spotify's official standalone Connect receiver (introduced 2026) that requires each user to download Spotify's proprietary binary and supply their own non-redistributable Soloist key (90-day expiry).
-- **Recommended usage:** Run Spotify Soloist normally so it appears in your Spotify Connect device list; Spotirust controls it cleanly through standard Spotify Connect (`/me/player/*`).
-- **Why direct Soloist WebSocket (`--ws`) is NOT built in:** Soloist's optional local WebSocket interface (`127.0.0.1`) is disabled by default, requires opt-in flags, and exposes an unauthenticated localhost control channel. Using standard Spotify Connect keeps authentication and security unified without distributing or depending on proprietary binaries.
+### Built-in Spotify Soloist Engine (`⚡ Soloist` — Recommended for Standalone Spotify Playback)
+Spotify Soloist (`soloist` / `soloist.exe`) is Spotify's official headless Spotify Connect engine (Linux `x86_64`/`arm64`/`arm32`, macOS Apple Silicon `arm64`, Windows `x86_64`). Spotirust integrates and supervises Soloist directly so you can close the official Spotify app after one-time pairing:
+1. Open **Settings → Spotify Soloist — Built-in Headless Engine**.
+2. **Step 1 (Personal API Key):** Click **Get Key on Spotify Dashboard** (`https://developer.spotify.com/dashboard/soloist`, requires **Spotify Premium**), copy your personal Soloist API key, paste it into Spotirust, and click **Save Key**. The key is stored strictly in your OS credential vault (`keyring`, service `com.spotirust.desktop`, account `spotify_soloist_api_key`) — never in SQLite or logs.
+3. **Step 2 (Official Binary):** Click **Download / Update Soloist** to fetch the official archive directly from Spotify's CDN (`soloist-builds.spotifycdn.com`) with executable-header verification, or click **Browse Local Binary…** if you already downloaded it. Spotirust never bundles or redistributes Spotify's proprietary binary.
+4. **Step 3 (One-Time Pairing):** Click **Start Soloist**, then open the official Spotify app (phone or PC on the same network) **once** and select your Soloist device (default: `Spotirust`) in Connect devices. Spotirust persists the Connect session inside `<data_dir>/soloist/data/` — after pairing completes, **you can close the official Spotify app permanently** and keep playing Spotify tracks directly inside Spotirust.
+- **Security & Lifecycle:** Spotirust spawns `soloist --ws 127.0.0.1:0` (ephemeral loopback port discovered via `ws.addr`/`ws.port`), redacts your API key from any diagnostic stderr logs, and terminates the child daemon cleanly on app exit (`kill_on_drop` + `on_exit`).
+- **90-Day Build Expiry:** Official Soloist builds expire after 90 days (exit code `10`). Spotirust detects exit code `10` automatically and surfaces a one-click **Update Soloist** button.
 
 ### Community `librespot` Backend (`--features librespot-backend`)
 - Since August 10, 2026 (`librespot-org/librespot#1737`), Spotify blocks `login5` token exchange for third-party developer Client IDs (`FaultyRequest(INVALID_CREDENTIALS)`).
-- Spotirust refuses to embed unauthorized first-party credentials. Use **Spotify Connect** for Spotify tracks or **Local Player (`rodio`)** for local audio files.
+- Spotirust refuses to embed unauthorized first-party credentials. Use **Spotify Soloist (`⚡ Soloist`)** for standalone Spotify playback, **Spotify Connect (`📡 Connect`)** for external Connect devices, or **Local Player (`🎵 Local`)** for local audio files.
 
 ### Local Audio Device / ALSA Errors on Linux
 - Verify PipeWire / PulseAudio / ALSA is running (`pactl info` or `aplay -l`).

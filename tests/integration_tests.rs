@@ -4055,3 +4055,607 @@ async fn spotify_auth_service_full_lifecycle_restart_logout_relogin_and_error_pa
     token_server.abort();
     api_server.abort();
 }
+
+// =============================================================================
+// 11. Spotify Soloist Local WebSocket Protocol, Daemon Supervision & Connect Fallback
+// =============================================================================
+
+#[tokio::test]
+async fn soloist_ws_protocol_playback_clock_and_commands_end_to_end() {
+    use futures_util::{SinkExt, StreamExt};
+    use spotirust::audio::soloist::SoloistStatus;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (srv_push_tx, mut srv_push_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (client_cmd_tx, mut client_cmd_rx) =
+        tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let (mut writer, mut reader) = ws.split();
+
+        loop {
+            tokio::select! {
+                Some(outgoing) = srv_push_rx.recv() => {
+                    if writer.send(Message::Text(outgoing.into())).await.is_err() {
+                        break;
+                    }
+                }
+                incoming = reader.next() => {
+                    match incoming {
+                        Some(Ok(Message::Text(txt))) => {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(txt.as_str()) {
+                                let _ = client_cmd_tx.send(val);
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let controller = PlaybackController::for_testing_with_soloist(tmp.path().to_path_buf());
+    let listener_handle = controller.spawn_soloist_event_listener();
+    let soloist = controller.soloist().clone();
+
+    soloist
+        .connect_external_ws(format!("ws://{addr}"), "Spotirust Desk".to_string())
+        .await
+        .unwrap();
+
+    // 1. Server sends auth_state with logged_in: false -> WaitingForPairing
+    srv_push_tx
+        .send(
+            r#"{"type":"auth_state","logged_in":false,"is_active":false,"device_name":"Spotirust Desk"}"#
+                .to_string(),
+        )
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let st = soloist.runtime_snapshot().await;
+            if matches!(st.status, SoloistStatus::WaitingForPairing { .. }) && !st.logged_in {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("should report WaitingForPairing before one-time Connect handshake");
+
+    // 2. Server completes pairing -> auth_state logged_in: true -> client requests get_state + get_queue
+    srv_push_tx
+        .send(
+            r#"{"type":"auth_state","logged_in":true,"is_active":false,"device_name":"Spotirust Desk"}"#
+                .to_string(),
+        )
+        .unwrap();
+
+    let cmd1 = tokio::time::timeout(Duration::from_secs(3), client_cmd_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let cmd2 = tokio::time::timeout(Duration::from_secs(3), client_cmd_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cmd1["type"], "command");
+    assert_eq!(cmd1["command"], "get_state");
+    assert_eq!(cmd2["type"], "command");
+    assert_eq!(cmd2["command"], "get_queue");
+    assert_eq!(cmd2["limit"], 50);
+
+    let snap_rt = soloist.runtime_snapshot().await;
+    assert!(snap_rt.logged_in);
+    assert!(matches!(
+        snap_rt.status,
+        SoloistStatus::Connected {
+            is_active: false,
+            ..
+        }
+    ));
+
+    // 3. Switch controller to SpotifySoloist (triggers immediate get_state + get_queue sync)
+    controller
+        .set_preferred_backend(AudioBackendKind::SpotifySoloist)
+        .await;
+    let sw1 = tokio::time::timeout(Duration::from_secs(3), client_cmd_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let sw2 = tokio::time::timeout(Duration::from_secs(3), client_cmd_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sw1["command"], "get_state");
+    assert_eq!(sw2["command"], "get_queue");
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    srv_push_tx
+        .send(format!(
+            r#"{{
+                "type": "playback_state",
+                "status": "playing",
+                "item": {{
+                    "uri": "spotify:track:sol_track_1",
+                    "entity_type": "track",
+                    "decorations": {{
+                        "identity": {{ "name": "Headless Groove" }},
+                        "visual_identity": {{
+                            "cover": [{{ "url": "https://i.scdn.co/large_art", "size": "large" }}]
+                        }},
+                        "parent": {{
+                            "entity": {{
+                                "uri": "spotify:album:sol_alb_1",
+                                "entity_type": "album",
+                                "decorations": {{ "identity": {{ "name": "Soloist Sessions" }} }}
+                            }}
+                        }},
+                        "creators": [{{
+                            "entity": {{
+                                "uri": "spotify:artist:sol_art_1",
+                                "entity_type": "artist",
+                                "decorations": {{ "identity": {{ "name": "Rust Ensemble" }} }}
+                            }}
+                        }}],
+                        "playback": {{ "duration_ms": 240000, "content_ratings": ["explicit"] }}
+                    }}
+                }},
+                "position": {{ "position_ms": 15000, "timestamp_ms": {now_unix_ms}, "speed": 1.0 }},
+                "volume": 72,
+                "is_active": false,
+                "options": {{ "shuffle": true, "repeat": "context", "playback_speed": 1.0 }}
+            }}"#
+        ))
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let s = controller.snapshot().await;
+            if s.backend == AudioBackendKind::SpotifySoloist
+                && s.status == PlaybackStatus::Playing
+                && s.current_track.as_ref().map(|t| t.id.as_str()) == Some("sol_track_1")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("PlaybackController should synchronize with Soloist playback_state");
+
+    let snap = controller.snapshot().await;
+    let track = snap.current_track.as_ref().unwrap();
+    assert_eq!(track.title, "Headless Groove");
+    assert_eq!(track.artists, vec!["Rust Ensemble"]);
+    assert_eq!(track.album_name, "Soloist Sessions");
+    assert_eq!(
+        track.artwork_url.as_deref(),
+        Some("https://i.scdn.co/large_art")
+    );
+    assert!(track.explicit);
+    assert!((snap.volume - 0.72).abs() < 0.01);
+    assert!(snap.shuffle);
+    assert_eq!(snap.repeat, RepeatMode::Context);
+    assert!(snap.position.current_ms() >= 14_800 && snap.position.current_ms() < 18_000);
+
+    // 4. Granular position_sync + volume_changed + queue_changed
+    let sync_ts = chrono::Utc::now().timestamp_millis();
+    srv_push_tx
+        .send(format!(
+            r#"{{"type":"position_sync","position":{{"position_ms":91000,"timestamp_ms":{sync_ts},"speed":1.0}}}}"#
+        ))
+        .unwrap();
+    srv_push_tx
+        .send(r#"{"type":"volume_changed","volume":45}"#.to_string())
+        .unwrap();
+    srv_push_tx
+        .send(
+            r#"{
+                "type":"queue_changed",
+                "previous":[],
+                "upcoming":[{
+                    "uid":"q1",
+                    "source":"user",
+                    "item":{
+                        "uri":"spotify:track:sol_track_2",
+                        "entity_type":"track",
+                        "decorations":{
+                            "identity":{"name":"Next Track"},
+                            "playback":{"duration_ms":180000,"content_ratings":[]}
+                        }
+                    }
+                }]
+            }"#
+            .to_string(),
+        )
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let s = controller.snapshot().await;
+            if (s.volume - 0.45).abs() < 0.01 && s.position.current_ms() >= 90_000 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("PlaybackController should absorb position_sync and volume_changed");
+
+    // 5. Outbound transport & option commands verify exact official Soloist JSON schema
+    // Play a Spotify track while is_active == false -> sends activate, then play(uri)
+    let mut sp_track = make_track("sol_track_3", "Play Me", "Artist", 200_000);
+    sp_track.uri = "spotify:track:sol_track_3".to_string();
+    controller
+        .play_track_in_context(sp_track.clone(), vec![sp_track.clone()])
+        .await
+        .unwrap();
+
+    let mut received = Vec::new();
+    for _ in 0..2 {
+        received.push(
+            tokio::time::timeout(Duration::from_secs(3), client_cmd_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert_eq!(received[0]["command"], "activate");
+    assert_eq!(received[1]["command"], "play");
+    assert_eq!(received[1]["uri"], "spotify:track:sol_track_3");
+
+    // Mark device active so resume does not re-send activate
+    srv_push_tx
+        .send(
+            r#"{"type":"device_changed","is_active":true,"device_name":"Spotirust Desk"}"#
+                .to_string(),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !soloist.is_active_device().await {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    controller.pause().await.unwrap();
+    controller.resume().await.unwrap();
+    controller.seek(42_500).await.unwrap();
+    controller.set_volume(0.83).await.unwrap();
+    controller.toggle_shuffle().await;
+    // Currently RepeatMode::Context -> cycle_repeat transitions to RepeatMode::Track (2 ordered frames!)
+    controller.cycle_repeat().await;
+    controller.add_to_queue(sp_track).await.unwrap();
+    controller.next().await.unwrap();
+    // At 42.5s (> 3s), previous() restarts the track via seek(0); at 0ms, previous() sends skip_prev!
+    controller.previous().await.unwrap();
+    controller.previous().await.unwrap();
+
+    let mut cmds = Vec::new();
+    for _ in 0..12 {
+        cmds.push(
+            tokio::time::timeout(Duration::from_secs(3), client_cmd_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert_eq!(cmds[0]["command"], "pause");
+    assert_eq!(cmds[1]["command"], "play");
+    assert!(cmds[1].get("uri").is_none());
+    assert_eq!(cmds[2]["command"], "seek");
+    assert_eq!(cmds[2]["position_ms"], 42_500);
+    assert_eq!(cmds[3]["command"], "set_volume");
+    assert_eq!(cmds[3]["volume"], 83);
+    assert_eq!(cmds[4]["command"], "set_shuffle");
+    assert_eq!(cmds[4]["enabled"], false);
+    assert_eq!(cmds[5]["command"], "set_repeat_context");
+    assert_eq!(cmds[5]["enabled"], false);
+    assert_eq!(cmds[6]["command"], "set_repeat_track");
+    assert_eq!(cmds[6]["enabled"], true);
+    assert_eq!(cmds[7]["command"], "add_to_queue");
+    assert_eq!(cmds[7]["uri"], "spotify:track:sol_track_3");
+    assert_eq!(cmds[8]["command"], "get_queue");
+    assert_eq!(cmds[9]["command"], "skip_next");
+    assert_eq!(cmds[10]["command"], "seek");
+    assert_eq!(cmds[10]["position_ms"], 0);
+    assert_eq!(cmds[11]["command"], "skip_prev");
+
+    soloist.stop().await;
+    assert_eq!(
+        soloist.runtime_snapshot().await.status,
+        SoloistStatus::Stopped
+    );
+    listener_handle.abort();
+    server_task.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn soloist_managed_daemon_expiry_exit_code_10_redaction_and_ws_discovery() {
+    use futures_util::SinkExt;
+    use spotirust::audio::soloist::{SoloistEngine, SoloistStatus};
+    use std::os::unix::fs::PermissionsExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let data_dir = tmp.path().join("data");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+
+    let write_script = |name: &str, body: &str| {
+        let p = bin_dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&p, perms).unwrap();
+        p
+    };
+
+    let engine = SoloistEngine::new(bin_dir.clone(), data_dir.clone(), cache_dir);
+
+    // Case A: Exit code 10 -> official 90-day build expiry detection
+    let expired_script = write_script("soloist_expired", "#!/bin/sh\nexit 10\n");
+    engine
+        .start_managed(
+            expired_script,
+            "Spotirust".to_string(),
+            "test-api-key-secret".to_string(),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if matches!(
+                engine.runtime_snapshot().await.status,
+                SoloistStatus::Expired { .. }
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("exit code 10 must transition SoloistStatus to Expired");
+
+    // Case B: Non-zero crash printing API key to stderr -> secret MUST be redacted
+    let leak_script = write_script(
+        "soloist_crash",
+        "#!/bin/sh\necho 'auth rejected for key super-secret-soloist-key-xyz' >&2\nexit 2\n",
+    );
+    engine
+        .start_managed(
+            leak_script,
+            "Spotirust".to_string(),
+            "super-secret-soloist-key-xyz".to_string(),
+        )
+        .await
+        .unwrap();
+
+    let err_msg = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let SoloistStatus::Error { message } = engine.runtime_snapshot().await.status {
+                break message;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("crash exit must transition SoloistStatus to Error");
+    assert!(
+        !err_msg.contains("super-secret-soloist-key-xyz"),
+        "API key must NEVER leak in Soloist error diagnostics: {err_msg}"
+    );
+    assert!(err_msg.contains("[REDACTED]"));
+
+    // Case C: Real ws.addr / ws.port discovery + WebSocket handshake + clean stop()
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
+    let ws_server = tokio::spawn(async move {
+        let (stream, _) = ws_listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let _ = ws
+            .send(Message::Text(
+                r#"{"type":"auth_state","logged_in":true,"is_active":true,"device_name":"Spotirust Managed"}"#
+                    .into(),
+            ))
+            .await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    let ws_script = write_script(
+        "soloist_ok",
+        &format!(
+            "#!/bin/sh\n\
+             DATA_DIR=''\n\
+             while [ $# -gt 0 ]; do\n\
+               if [ \"$1\" = '--data-dir' ]; then DATA_DIR=\"$2\"; shift 2; else shift; fi\n\
+             done\n\
+             printf '127.0.0.1' > \"$DATA_DIR/ws.addr\"\n\
+             printf '{ws_port}' > \"$DATA_DIR/ws.port\"\n\
+             sleep 30\n"
+        ),
+    );
+
+    engine
+        .start_managed(
+            ws_script,
+            "Spotirust Managed".to_string(),
+            "key-ok".to_string(),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                engine.runtime_snapshot().await.status,
+                SoloistStatus::Connected {
+                    is_active: true,
+                    ws_port: p,
+                    ..
+                } if p == ws_port
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("managed Soloist should discover ws.addr/ws.port and connect over WebSocket");
+
+    engine.stop().await;
+    assert_eq!(
+        engine.runtime_snapshot().await.status,
+        SoloistStatus::Stopped
+    );
+    ws_server.abort();
+}
+
+#[tokio::test]
+async fn spotify_connect_auto_resolves_device_from_devices_endpoint() {
+    use spotirust::spotify::client::SpotifyClient;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let playing = Arc::new(AtomicBool::new(false));
+    let played_device = Arc::new(Mutex::new(String::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let playing_srv = Arc::clone(&playing);
+    let played_dev_srv = Arc::clone(&played_device);
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let playing_c = Arc::clone(&playing_srv);
+            let played_dev_c = Arc::clone(&played_dev_srv);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req.lines().next().unwrap_or("");
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let target = parts.next().unwrap_or("");
+
+                let response = if method == "GET" && target.starts_with("/me/player/devices") {
+                    let body = r#"{"devices":[
+                        {"id":"dev_restricted","is_active":false,"is_restricted":true,"name":"Locked Speaker","type":"Speaker","volume_percent":50},
+                        {"id":"dev_soloist_1","is_active":false,"is_restricted":false,"name":"Spotirust Soloist","type":"Computer","volume_percent":80}
+                    ]}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else if method == "PUT" && target.starts_with("/me/player/play") {
+                    if let Some(q) = target.split_once('?').map(|(_, q)| q) {
+                        *played_dev_c.lock().unwrap() = q.to_string();
+                    }
+                    playing_c.store(true, Ordering::SeqCst);
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else if method == "GET" && target == "/me/player" {
+                    if !playing_c.load(Ordering::SeqCst) {
+                        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    } else {
+                        let body = r#"{
+                            "is_playing": true,
+                            "progress_ms": 1200,
+                            "shuffle_state": false,
+                            "repeat_state": "off",
+                            "device": {"id":"dev_soloist_1","is_active":true,"is_restricted":false,"name":"Spotirust Soloist","type":"Computer","volume_percent":80},
+                            "item": {
+                                "id": "sp_fallback_1",
+                                "uri": "spotify:track:sp_fallback_1",
+                                "name": "Connect Fallback Song",
+                                "duration_ms": 195000,
+                                "explicit": false,
+                                "artists": [{"id":"a1","uri":"spotify:artist:a1","name":"Fallback Artist"}],
+                                "album": {"id":"alb1","uri":"spotify:album:alb1","name":"Fallback Album","images":[]}
+                            }
+                        }"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    }
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+
+                let _ = sock.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    let store = Arc::new(MemoryCredentialStore::new());
+    let session = SessionManager::new(
+        store,
+        Some("test-client".to_string()),
+        0,
+        "/callback".to_string(),
+    );
+    session
+        .set_tokens(StoredTokenBundle {
+            access_token: "mock-access-token".to_string(),
+            refresh_token: None,
+            token_type: "Bearer".to_string(),
+            scope: "user-read-playback-state user-modify-playback-state".to_string(),
+            expires_at_unix: 9_999_999_999,
+            client_id: "test-client".to_string(),
+        })
+        .await;
+
+    let spotify = SpotifyClient::new(session).with_base_url(format!("http://{addr}"));
+    let controller = PlaybackController::new(Some(spotify), None, PlaybackEventBus::default());
+    controller
+        .set_preferred_backend(AudioBackendKind::SpotifyConnect)
+        .await;
+
+    // Even before any manual device refresh, playing a Spotify track must query /me/player/devices,
+    // skip the restricted speaker, target dev_soloist_1, and confirm Playing!
+    let mut sp_track = make_track(
+        "sp_fallback_1",
+        "Connect Fallback Song",
+        "Fallback Artist",
+        195_000,
+    );
+    sp_track.uri = "spotify:track:sp_fallback_1".to_string();
+    controller
+        .play_track_in_context(sp_track.clone(), vec![sp_track])
+        .await
+        .expect(
+            "Connect play_track_in_context should auto-resolve available non-restricted device",
+        );
+
+    assert_eq!(
+        played_device.lock().unwrap().as_str(),
+        "device_id=dev_soloist_1"
+    );
+    let snap = controller.snapshot().await;
+    assert_eq!(snap.status, PlaybackStatus::Playing);
+    assert_eq!(snap.backend, AudioBackendKind::SpotifyConnect);
+    assert_eq!(
+        snap.active_device_name.as_deref(),
+        Some("Spotirust Soloist")
+    );
+
+    server.abort();
+}

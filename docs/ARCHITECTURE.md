@@ -65,9 +65,9 @@ Before writing code, all current Spotify Developer documentation and `librespot`
 | **Search (Tracks/Artists/Albums/Playlists)** | `src/spotify/search.rs` | Official | Dev Mode owner | Debounced, cached, `limit <= 10` for Feb 2026 Dev Mode compatibility |
 | **Library (Saved Tracks, Albums, Followed Artists, Playlists)** | `src/spotify/library.rs`, `playlists.rs` | Official | Dev Mode owner | Supports both Feb 2026 `/me/library` + `/playlists/{id}/items` and legacy fallbacks |
 | **Home Feed (Recently Played, Top Items, Saved)** | `src/spotify/library.rs` | Official | Dev Mode owner | Built from surviving endpoints (`recently-played`, `me/top`, `me/playlists`, `me/albums`) since `/recommendations` & `/browse/*` were removed |
-| **Playback Control via Spotify Connect API** | `src/audio/connect.rs` (`/me/player/*`) | Official | **Yes** | Controls any active Connect target (Desktop app, speaker, Spotify Soloist) |
+| **Playback Control via Spotify Connect API** | `src/audio/connect.rs` (`/me/player/*`) | Official | **Yes** | Controls any active Connect target (Desktop app, speaker, Spotify Soloist) with automatic `/me/player/devices` fallback |
+| **Built-in Spotify Soloist Headless Engine (`--ws 127.0.0.1:0`)** | `src/audio/soloist.rs` + `src/audio/playback.rs` | Official (User-Fetched Binary) | **Yes** | Downloads official CDN binary on user action (never redistributed), stores user's personal API key strictly in OS keyring, supervises local loopback WebSocket for zero-polling real-time playback & karaoke sync even after closing the official Spotify app |
 | **Direct Streaming via `librespot` 0.8** | `src/audio/librespot_engine.rs` (`--features librespot-backend`) | Community / Unofficial | **Yes** | Compiled & integrated; blocked on third-party OAuth tokens since Aug 2026 (`librespot#1737`) without ZeroConf/stored session blob |
-| **Spotify Soloist Local Companion** | Documented & Connect-compatible | Official (External) | Setup: Yes | User installs official Soloist binary; Spotirust can control it via Spotify Connect |
 | **Local Audio Playback (`rodio`)** | `src/audio/local_rodio.rs` | Native / Offline | No | Plays real local MP3/FLAC/OGG/WAV files (plus locally synthesized Soundcheck WAVs) directly via OS audio sink with duration probing & `OutputStream` release on stop |
 | **TTML Word-by-Word Parser (W3C + local AMLL-schema)** | `src/lyrics/ttml.rs` | Open Standard | No | Full word/syllable timing, `TtmlLine` fallback, `x-bg`, `x-translation`, `x-roman`, sidecar translations, missing-end & duplicate-timestamp inference, strict XML validation. **No Apple Music API integration.** |
 | **Enhanced LRC & Standard LRC Parser** | `src/lyrics/lrc.rs` | Open Standard | No | `<mm:ss.xx>` word tags, `[mm:ss.xx]` line tags, shifted multi-timestamp expansion, `[offset:]` |
@@ -86,7 +86,7 @@ Before writing code, all current Spotify Developer documentation and `librespot`
 ```text
 +-------------------------------------------------------------------------+
 |                           GUI Thread (eframe/egui)                      |
-|  Sidebar | Top Nav (Local/Connect) | Home | Search | Library | Queue    |
+|  Sidebar | Top Nav (Soloist/Local/Connect) | Home | Search | Library    |
 |  Player Bar (Device Status) | Now Playing / Karaoke | Settings & Themes |
 +--------------------+----------------------------------+-----------------+
                      | AppCommand (mpsc)                ^ AppEvent (mpsc / broadcast)
@@ -104,6 +104,7 @@ Before writing code, all current Spotify Developer documentation and `librespot`
 |                                                                         |
 |  +-------------------------------------------------------------------+  |
 |  | AudioEngine Abstraction + Queue Manager + Event Bus               |  |
+|  |  - SoloistEngine (Official Headless Daemon + ws://127.0.0.1:0)    |  |
 |  |  - SpotifyConnectEngine (Official /me/player/* + Confirmation)    |  |
 |  |  - LocalRodioPlayer (Real MP3/FLAC/OGG/WAV via rodio 0.21)        |  |
 |  |  - LibrespotEngine (Feature: librespot-backend — Blocked Aug 2026)|  |
@@ -170,7 +171,8 @@ Spotirust/
 │   │   ├── engine.rs           # async trait AudioEngine, PlaybackPosition, RepeatMode
 │   │   ├── events.rs           # PlaybackEvent broadcast channel
 │   │   ├── queue.rs            # Queue, history, Fisher-Yates shuffle, repeat modes
-│   │   ├── playback.rs         # Unified PlaybackController (Connect Remote + Local Rodio + Librespot)
+│   │   ├── playback.rs         # Unified PlaybackController (Soloist + Connect Remote + Local Rodio + Librespot)
+│   │   ├── soloist.rs          # Official Spotify Soloist daemon supervisor, CDN downloader & local WS client
 │   │   ├── connect.rs          # Official Spotify Connect Web API backend (/me/player/*)
 │   │   ├── local_rodio.rs      # Native rodio player + lofty metadata/artwork + SQLite incremental scan
 │   │   └── librespot_engine.rs # Optional librespot 0.8 backend (--features librespot-backend)
@@ -219,7 +221,10 @@ All direct dependencies were audited via `cargo info` against crates.io (Novembe
 |---|---|---|---|
 | `eframe` | `0.37.0` | Native cross-platform app shell (`glow` / optional `wgpu`, Wayland/X11/macOS/Win) | MIT OR Apache-2.0 |
 | `egui` | `0.37.0` | Immediate-mode native Rust GUI | MIT OR Apache-2.0 |
-| `tokio` | `1.54` | Async runtime (`rt-multi-thread`, `net`, `sync`, `time`, `fs`) | MIT |
+| `tokio` | `1.54` | Async runtime (`rt-multi-thread`, `net`, `sync`, `time`, `fs`, `process`) | MIT |
+| `tokio-tungstenite` | `0.28` | Local loopback WebSocket client for Spotify Soloist (`ws://127.0.0.1:0`) | MIT |
+| `futures-util` | `0.3` | Async stream/sink combinators for Soloist WebSocket transport | MIT OR Apache-2.0 |
+| `flate2` | `1.1` | Pure-Rust gzip/deflate decompression for official Spotify Soloist archives | MIT OR Apache-2.0 |
 | `reqwest` | `0.13` | Async HTTP/2 client with `rustls` TLS | MIT OR Apache-2.0 |
 | `serde` / `serde_json` | `1.0` | Serialization / JSON API parsing | MIT OR Apache-2.0 |
 | `rusqlite` | `0.43` (`bundled`) | Embedded SQLite database with bundled C library | MIT |

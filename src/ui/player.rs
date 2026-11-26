@@ -559,6 +559,9 @@ fn playback_target_badge(
             (format!("⚠ {short}"), theme.danger)
         }
         PlaybackStatus::Loading => match playback.backend {
+            AudioBackendKind::SpotifySoloist => {
+                ("Buffering on Soloist…".to_string(), theme.warning)
+            }
             AudioBackendKind::SpotifyConnect => {
                 ("Syncing with Connect…".to_string(), theme.warning)
             }
@@ -567,6 +570,10 @@ fn playback_target_badge(
         },
         PlaybackStatus::Reconnecting => ("Reconnecting…".to_string(), theme.warning),
         PlaybackStatus::Playing => match playback.backend {
+            AudioBackendKind::SpotifySoloist => {
+                let dev = playback.active_device_name.as_deref().unwrap_or("Soloist");
+                (format!("● Playing on Soloist ({dev})"), theme.accent)
+            }
             AudioBackendKind::SpotifyConnect => {
                 let dev = playback
                     .active_device_name
@@ -578,6 +585,10 @@ fn playback_target_badge(
             AudioBackendKind::Librespot => ("● Librespot".to_string(), theme.accent),
         },
         PlaybackStatus::Paused => match playback.backend {
+            AudioBackendKind::SpotifySoloist => {
+                let dev = playback.active_device_name.as_deref().unwrap_or("Soloist");
+                (format!("Paused · Soloist ({dev})"), theme.text_muted)
+            }
             AudioBackendKind::SpotifyConnect => {
                 let dev = playback.active_device_name.as_deref().unwrap_or("Connect");
                 (format!("Paused on {dev}"), theme.text_muted)
@@ -586,6 +597,13 @@ fn playback_target_badge(
             AudioBackendKind::Librespot => ("Paused · Librespot".to_string(), theme.text_muted),
         },
         PlaybackStatus::Stopped => match playback.backend {
+            AudioBackendKind::SpotifySoloist => match playback.active_device_name.as_deref() {
+                Some(dev) => (format!("Soloist ready · {dev}"), theme.text_muted),
+                None => (
+                    "Soloist mode · Configure in Settings".to_string(),
+                    theme.text_muted,
+                ),
+            },
             AudioBackendKind::SpotifyConnect => match playback.active_device_name.as_deref() {
                 Some(dev) => (format!("Connect ready · {dev}"), theme.text_muted),
                 None => (

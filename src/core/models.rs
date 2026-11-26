@@ -47,6 +47,9 @@ impl RepeatMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioBackendKind {
+    /// Official Spotify Soloist headless playback engine managed locally via `--ws 127.0.0.1:0`
+    /// (requires personal Soloist API key & Spotify Premium; works after closing the official Spotify app).
+    SpotifySoloist,
     /// Official Spotify Web API Connect remote controller (`/me/player/*`, requires Premium & active device).
     SpotifyConnect,
     /// Native local audio file playback via `rodio` (MP3, FLAC, OGG, WAV).
@@ -60,6 +63,7 @@ pub enum AudioBackendKind {
 impl AudioBackendKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::SpotifySoloist => "spotify_soloist",
             Self::SpotifyConnect => "spotify_connect",
             Self::LocalRodio => "local_rodio",
             Self::Librespot => "librespot",
@@ -68,6 +72,7 @@ impl AudioBackendKind {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::SpotifySoloist => "Spotify Soloist (Built-in Headless Engine)",
             Self::SpotifyConnect => "Spotify Connect (Remote)",
             Self::LocalRodio => "Local Player (Rodio)",
             Self::Librespot => "Librespot 0.8 (Blocked / Experimental)",
@@ -76,6 +81,7 @@ impl AudioBackendKind {
 
     pub fn short_label(self) -> &'static str {
         match self {
+            Self::SpotifySoloist => "Soloist",
             Self::SpotifyConnect => "Spotify Connect",
             Self::LocalRodio => "Local Player",
             Self::Librespot => "Librespot (Blocked)",
@@ -84,6 +90,7 @@ impl AudioBackendKind {
 
     pub fn from_db_str(value: &str) -> Self {
         match value {
+            "spotify_soloist" => Self::SpotifySoloist,
             "spotify_connect" => Self::SpotifyConnect,
             "librespot" => Self::Librespot,
             _ => Self::LocalRodio,

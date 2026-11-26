@@ -6,13 +6,59 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      run_lint_and_test:
+        description: "Run Linux fmt/clippy/test job"
+        type: boolean
+        default: false
+      build_linux:
+        description: "Build Linux x86_64 portable archive"
+        type: boolean
+        default: false
+      build_macos:
+        description: "Build macOS ARM64 portable archive"
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  build-windows-portable:
+    name: Build Portable (Windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIRUST_CLIENT_ID: ${{ secrets.SPOTIRUST_CLIENT_ID }}
+          SPOTIFY_REDIRECT_URI: ${{ secrets.SPOTIFY_REDIRECT_URI }}
+        run: cargo build --release
+      - name: Verify release binary (Windows)
+        shell: pwsh
+        run: .\target\release\spotirust.exe --diagnostics
+      - name: Package portable bundle (Windows)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\spotirust | Out-Null
+          Copy-Item -Path target\release\spotirust.exe -Destination dist\spotirust\
+          Copy-Item -Path README.md, LICENSE -Destination dist\spotirust\
+          Copy-Item -Path assets, docs -Destination dist\spotirust\ -Recurse
+          foreach ($doc in @("PRODUCTION_READINESS.md", "PERFORMANCE_REPORT.md")) {
+            if (Test-Path $doc) { Copy-Item -Path $doc -Destination dist\spotirust\ }
+          }
+          New-Item -ItemType File -Force -Path dist\spotirust\portable.flag | Out-Null
+          Compress-Archive -Path dist\spotirust\* -DestinationPath "spotirust-windows-x86_64-portable.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spotirust-windows-x86_64-portable.zip
+          path: spotirust-windows-x86_64-portable.zip
+
   lint-and-test:
     name: Format, Clippy, Test & Librespot Check (Linux)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_lint_and_test }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -40,27 +86,14 @@ jobs:
       - name: Run headless diagnostics benchmark
         run: cargo run --release -- --diagnostics
 
-  build-matrix:
-    name: Build Release (${{ matrix.label }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: Linux x86_64
-            os: ubuntu-24.04
-            archive: spotirust-linux-x86_64-portable.tar.gz
-          - label: macOS ARM64
-            os: macos-latest
-            archive: spotirust-macos-arm64-portable.tar.gz
-          - label: Windows x86_64
-            os: windows-latest
-            archive: spotirust-windows-x86_64-portable.zip
-    runs-on: ${{ matrix.os }}
+  build-linux-portable:
+    name: Build Portable (Linux x86_64)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_linux }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux deps
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -72,33 +105,51 @@ jobs:
           SPOTIRUST_CLIENT_ID: ${{ secrets.SPOTIRUST_CLIENT_ID }}
           SPOTIFY_REDIRECT_URI: ${{ secrets.SPOTIFY_REDIRECT_URI }}
         run: cargo build --release
-      - name: Verify release binary (Unix)
-        if: runner.os != 'Windows'
+      - name: Verify release binary (Linux)
         run: ./target/release/spotirust --diagnostics
-      - name: Verify release binary (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: .\target\release\spotirust.exe --diagnostics
-      - name: Package portable bundle (Unix)
-        if: runner.os != 'Windows'
+      - name: Package portable bundle (Linux)
         run: |
           mkdir -p dist/spotirust
           cp target/release/spotirust dist/spotirust/
           cp README.md LICENSE dist/spotirust/
-          cp -r assets dist/spotirust/
+          cp -r assets docs dist/spotirust/
+          for doc in PRODUCTION_READINESS.md PERFORMANCE_REPORT.md; do
+            if [ -f "$doc" ]; then cp "$doc" dist/spotirust/; fi
+          done
           touch dist/spotirust/portable.flag
-          tar -czf "${{ matrix.archive }}" -C dist spotirust
-      - name: Package portable bundle (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist\spotirust | Out-Null
-          Copy-Item target\release\spotirust.exe dist\spotirust\
-          Copy-Item README.md, LICENSE dist\spotirust\
-          Copy-Item -Recurse assets dist\spotirust\
-          New-Item -ItemType File -Force -Path dist\spotirust\portable.flag | Out-Null
-          Compress-Archive -Path dist\spotirust\* -DestinationPath "${{ matrix.archive }}"
+          tar -czf "spotirust-linux-x86_64-portable.tar.gz" -C dist spotirust
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.archive }}
-          path: ${{ matrix.archive }}
+          name: spotirust-linux-x86_64-portable.tar.gz
+          path: spotirust-linux-x86_64-portable.tar.gz
+
+  build-macos-portable:
+    name: Build Portable (macOS ARM64)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_macos }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIRUST_CLIENT_ID: ${{ secrets.SPOTIRUST_CLIENT_ID }}
+          SPOTIFY_REDIRECT_URI: ${{ secrets.SPOTIFY_REDIRECT_URI }}
+        run: cargo build --release
+      - name: Verify release binary (macOS)
+        run: ./target/release/spotirust --diagnostics
+      - name: Package portable bundle (macOS)
+        run: |
+          mkdir -p dist/spotirust
+          cp target/release/spotirust dist/spotirust/
+          cp README.md LICENSE dist/spotirust/
+          cp -r assets docs dist/spotirust/
+          for doc in PRODUCTION_READINESS.md PERFORMANCE_REPORT.md; do
+            if [ -f "$doc" ]; then cp "$doc" dist/spotirust/; fi
+          done
+          touch dist/spotirust/portable.flag
+          tar -czf "spotirust-macos-arm64-portable.tar.gz" -C dist spotirust
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spotirust-macos-arm64-portable.tar.gz
+          path: spotirust-macos-arm64-portable.tar.gz

@@ -122,6 +122,35 @@ impl SpotifyConnectEngine {
         Ok(())
     }
 
+    /// Ensure an active or available non-restricted Spotify Connect `device_id` is resolved before
+    /// sending play/resume commands so idle Spotify apps are woken automatically instead of failing
+    /// with `404 NO_ACTIVE_DEVICE`.
+    async fn resolve_target_device_id(&self) -> Option<String> {
+        if let Some(id) = self.active_device_id.read().await.clone() {
+            return Some(id);
+        }
+        #[derive(Deserialize)]
+        struct DevicesResp {
+            #[serde(default)]
+            devices: Vec<ApiDevice>,
+        }
+        let resp: DevicesResp = self.client.get_json("/me/player/devices", &[]).await.ok()?;
+        let picked = resp
+            .devices
+            .iter()
+            .find(|d| d.is_active && !d.is_restricted && d.id.is_some())
+            .or_else(|| {
+                resp.devices
+                    .iter()
+                    .find(|d| !d.is_restricted && d.id.is_some())
+            })?;
+        let id = picked.id.clone()?;
+        *self.active_device_id.write().await = Some(id.clone());
+        *self.active_device_name.write().await = Some(picked.name.clone());
+        *self.active_device_type.write().await = Some(picked.device_type.clone());
+        Some(id)
+    }
+
     /// Start playing one or more Spotify track URIs with an optional offset URI (`PUT /me/player/play`).
     pub async fn play_uris(
         &self,
@@ -134,7 +163,7 @@ impl SpotifyConnectEngine {
             ));
         }
         let mut query = Vec::new();
-        if let Some(id) = self.active_device_id.read().await.clone() {
+        if let Some(id) = self.resolve_target_device_id().await {
             query.push(("device_id", id));
         }
         let body = if let Some(offset) = offset_uri {
@@ -152,7 +181,7 @@ impl SpotifyConnectEngine {
     /// Add a Spotify URI to the active Connect device's playback queue (`POST /me/player/queue`).
     pub async fn add_to_queue_remote(&self, track_uri: &str) -> Result<(), AudioError> {
         let mut query = vec![("uri", track_uri.to_string())];
-        if let Some(id) = self.active_device_id.read().await.clone() {
+        if let Some(id) = self.resolve_target_device_id().await {
             query.push(("device_id", id));
         }
         self.send_with_retry(Method::POST, "/me/player/queue", &query, None)
@@ -235,22 +264,26 @@ impl SpotifyConnectEngine {
     }
 
     /// Query `GET /me/player` after issuing a remote command to confirm the device's real state.
-    /// Performs one brief follow-up poll (150ms) if the expected play/pause state hasn't settled yet.
+    /// Uses bounded progressive follow-up polls (`150ms`, `300ms`, `500ms`) so waking an idle or
+    /// mobile Spotify Connect app over WAN does not fail prematurely.
     pub async fn confirm_remote_state(
         &self,
         expected_playing: Option<bool>,
     ) -> Result<Option<RemotePlaybackState>, AudioError> {
-        let first = self.sync_remote_state().await?;
-        let matches = match (&first, expected_playing) {
-            (Some(s), Some(exp)) => s.is_playing == exp,
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
-        if matches {
-            return Ok(first);
+        let mut latest = self.sync_remote_state().await?;
+        for wait_ms in [150u64, 300, 500] {
+            let matches = match (&latest, expected_playing) {
+                (Some(s), Some(exp)) => s.is_playing == exp,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if matches {
+                return Ok(latest);
+            }
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            latest = self.sync_remote_state().await?;
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        self.sync_remote_state().await
+        Ok(latest)
     }
 
     pub async fn set_shuffle_remote(&self, enabled: bool) -> Result<(), AudioError> {
@@ -326,7 +359,7 @@ impl AudioEngine for SpotifyConnectEngine {
 
     async fn resume(&self) -> Result<(), AudioError> {
         let mut query = Vec::new();
-        if let Some(id) = self.active_device_id.read().await.clone() {
+        if let Some(id) = self.resolve_target_device_id().await {
             query.push(("device_id", id));
         }
         self.send_with_retry(Method::PUT, "/me/player/play", &query, None)

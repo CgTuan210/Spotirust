@@ -109,8 +109,9 @@ pub fn render_settings(
             settings_card(ui, &theme, "Audio Playback Operating Mode", |ui| {
                 ui.label(
                     RichText::new(
-                        "Spotirust strictly separates two honest modes and never simulates fake playback:\n\
-                         • Spotify Connect (Remote): controls an active external Spotify app, speaker, or Spotify Soloist (requires Spotify Premium).\n\
+                        "Spotirust strictly separates honest operating modes and never simulates fake playback:\n\
+                         • Spotify Soloist (Recommended for Spotify): manages Spotify's official headless playback engine locally via loopback WebSocket — works even after closing the official Spotify app (requires Spotify Premium & personal Soloist key).\n\
+                         • Spotify Connect (Remote): controls an active external Spotify app or speaker via Web API (requires Spotify Premium).\n\
                          • Local Player (Rodio): plays real local MP3/FLAC/OGG/WAV files natively on your sound card.",
                     )
                     .size(12.0)
@@ -119,6 +120,7 @@ pub fn render_settings(
                 ui.add_space(8.0);
 
                 for kind in [
+                    AudioBackendKind::SpotifySoloist,
                     AudioBackendKind::LocalRodio,
                     AudioBackendKind::SpotifyConnect,
                     AudioBackendKind::Librespot,
@@ -135,13 +137,271 @@ pub fn render_settings(
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(
-                        "Platform note: Direct in-window Spotify streaming via librespot 0.8 is currently blocked \
-                         for third-party OAuth tokens since Aug 10, 2026 (librespot#1737). Use Spotify Connect \
-                         for Spotify tracks or Local Player for local audio files.",
+                        "Platform note: Direct third-party OAuth streaming via librespot 0.8 is blocked since Aug 10, 2026 \
+                         (librespot#1737). Use Spotify Soloist to play Spotify tracks without keeping the official Spotify app open.",
                     )
                     .size(11.0)
                     .color(theme.text_muted),
                 );
+            });
+
+            ui.add_space(12.0);
+
+            // 2B. Spotify Soloist Setup & Daemon Management
+            settings_card(ui, &theme, "Spotify Soloist — Built-in Headless Engine", |ui| {
+                use crate::audio::soloist::{
+                    SOLOIST_DASHBOARD_URL, SOLOIST_DOWNLOADS_PAGE_URL, SoloistStatus,
+                };
+
+                let sol = &state.soloist;
+
+                // Live status pill banner
+                let (status_text, status_color) = match &sol.status {
+                    SoloistStatus::Connected {
+                        device_name,
+                        is_active,
+                        ws_port,
+                    } => (
+                        format!(
+                            "● Connected & Paired ('{device_name}' · {} · ws://127.0.0.1:{ws_port}) — You can close the official Spotify app!",
+                            if *is_active { "Active device" } else { "Standby / Ready" }
+                        ),
+                        theme.accent,
+                    ),
+                    SoloistStatus::WaitingForPairing {
+                        device_name,
+                        ws_port,
+                    } => (
+                        format!(
+                            "⏳ Waiting for one-time pairing (ws://127.0.0.1:{ws_port}): Open the Spotify app on your phone or PC on the same network → Connect to a device → select '{device_name}' ONCE. After pairing completes, you can close the official Spotify app."
+                        ),
+                        theme.warning,
+                    ),
+                    SoloistStatus::Downloading => (
+                        "⬇ Downloading official Spotify Soloist binary from Spotify CDN…".to_string(),
+                        theme.accent,
+                    ),
+                    SoloistStatus::Starting => (
+                        "Starting managed Spotify Soloist daemon…".to_string(),
+                        theme.warning,
+                    ),
+                    SoloistStatus::Expired { message } => (format!("⚠ {message}"), theme.danger),
+                    SoloistStatus::Error { message } => (format!("⚠ {message}"), theme.danger),
+                    SoloistStatus::Stopped => (
+                        "Stopped — Complete Steps 1 & 2 below, then click Start Soloist.".to_string(),
+                        theme.text_muted,
+                    ),
+                };
+
+                Frame::new()
+                    .fill(status_color.linear_multiply(0.14))
+                    .corner_radius(CornerRadius::same(8))
+                    .stroke(Stroke::new(1.0, status_color))
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            if matches!(
+                                sol.status,
+                                SoloistStatus::Downloading
+                                    | SoloistStatus::Starting
+                                    | SoloistStatus::WaitingForPairing { .. }
+                            ) {
+                                ui.spinner();
+                            }
+                            ui.label(
+                                RichText::new(status_text)
+                                    .size(12.0)
+                                    .color(theme.text_primary),
+                            );
+                        });
+                    });
+
+                ui.add_space(10.0);
+
+                // Step 1: Personal Soloist API Key (OS Keyring only)
+                ui.label(
+                    RichText::new("Step 1 · Personal Spotify Soloist API Key (OS Keyring only, never SQLite)")
+                        .size(12.5)
+                        .strong()
+                        .color(theme.text_primary),
+                );
+                ui.label(
+                    RichText::new(
+                        "Requires Spotify Premium. Each user must generate their own personal key on Spotify for Developers.",
+                    )
+                    .size(11.0)
+                    .color(theme.text_muted),
+                );
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.soloist_key_input)
+                            .password(true)
+                            .hint_text(if sol.api_key_configured {
+                                "Soloist API key stored in OS vault (paste new key to replace)"
+                            } else {
+                                "Paste your personal Spotify Soloist API key…"
+                            })
+                            .desired_width(300.0),
+                    );
+                    if ui.button("Save Key").clicked() {
+                        let key = state.soloist_key_input.trim().to_string();
+                        if !key.is_empty() {
+                            commands.push(AppCommand::SaveSoloistApiKey { api_key: Some(key) });
+                            state.soloist_key_input.clear();
+                        }
+                    }
+                    if sol.api_key_configured && ui.button("Clear Key").clicked() {
+                        commands.push(AppCommand::SaveSoloistApiKey { api_key: None });
+                    }
+                    if ui.button("Get Key on Spotify Dashboard ↗").clicked() {
+                        commands.push(AppCommand::OpenExternalUrl {
+                            url: SOLOIST_DASHBOARD_URL.to_string(),
+                        });
+                    }
+                });
+
+                ui.add_space(10.0);
+
+                // Step 2: Official Spotify Soloist Executable
+                ui.label(
+                    RichText::new("Step 2 · Official Spotify Soloist Executable (90-day build lifetime)")
+                        .size(12.5)
+                        .strong()
+                        .color(theme.text_primary),
+                );
+                let bin_line = match (&sol.binary_path, &sol.binary_version) {
+                    (Some(path), Some(ver)) => format!("Installed: {ver} ({})", path.display()),
+                    (Some(path), None) => format!("Installed: {}", path.display()),
+                    (None, _) => {
+                        if let Some(note) = &sol.platform_note {
+                            if sol.platform_supported {
+                                format!("Not installed yet · Host platform: {note}")
+                            } else {
+                                note.clone()
+                            }
+                        } else {
+                            "Not installed yet.".to_string()
+                        }
+                    }
+                };
+                ui.label(
+                    RichText::new(bin_line)
+                        .size(11.5)
+                        .color(if sol.binary_path.is_some() {
+                            theme.accent
+                        } else {
+                            theme.text_secondary
+                        }),
+                );
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    let is_downloading = matches!(sol.status, SoloistStatus::Downloading);
+                    let dl_label = if sol.binary_path.is_some() {
+                        "Update Soloist from Spotify CDN"
+                    } else {
+                        "Download & Install Soloist"
+                    };
+                    if ui
+                        .add_enabled(
+                            sol.platform_supported && !is_downloading,
+                            egui::Button::new(dl_label),
+                        )
+                        .clicked()
+                    {
+                        commands.push(AppCommand::DownloadSoloist);
+                    }
+                    if ui.button("Browse Existing Binary…").clicked() {
+                        commands.push(AppCommand::PickSoloistBinary);
+                    }
+                    if ui.button("Official Downloads Page ↗").clicked() {
+                        commands.push(AppCommand::OpenExternalUrl {
+                            url: SOLOIST_DOWNLOADS_PAGE_URL.to_string(),
+                        });
+                    }
+                });
+
+                ui.add_space(10.0);
+
+                // Step 3: Device Identity & Daemon Controls
+                ui.label(
+                    RichText::new("Step 3 · Device Identity & Background Engine Controls")
+                        .size(12.5)
+                        .strong()
+                        .color(theme.text_primary),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Device name:")
+                            .size(12.0)
+                            .color(theme.text_secondary),
+                    );
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut state.settings.soloist_device_name)
+                                .hint_text("Spotirust")
+                                .desired_width(180.0),
+                        )
+                        .changed()
+                    {
+                        settings_changed = true;
+                    }
+                    if ui
+                        .checkbox(
+                            &mut state.settings.soloist_auto_start,
+                            "Auto-start Soloist when Spotirust opens",
+                        )
+                        .changed()
+                    {
+                        settings_changed = true;
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    let can_start =
+                        sol.api_key_configured && sol.binary_path.is_some() && !sol.status.is_running();
+                    let start_btn = egui::Button::new(
+                        RichText::new("Start Soloist").strong().color(if can_start {
+                            Color32::BLACK
+                        } else {
+                            theme.text_muted
+                        }),
+                    )
+                    .fill(if can_start {
+                        theme.accent
+                    } else {
+                        theme.bg_surface
+                    });
+                    if ui.add_enabled(can_start, start_btn).clicked() {
+                        state.settings.audio_backend = AudioBackendKind::SpotifySoloist;
+                        commands.push(AppCommand::SaveSettings(state.settings.clone()));
+                        commands.push(AppCommand::StartSoloist);
+                    }
+
+                    if sol.status.is_running() {
+                        if ui.button("Restart Soloist").clicked() {
+                            commands.push(AppCommand::SaveSettings(state.settings.clone()));
+                            commands.push(AppCommand::RestartSoloist);
+                        }
+                        if ui.button("Stop Soloist").clicked() {
+                            commands.push(AppCommand::StopSoloist);
+                        }
+                    }
+
+                    if (sol.logged_in || sol.status.is_running())
+                        && ui
+                            .button("Re-pair Account")
+                            .on_hover_text(
+                                "Clears Soloist's stored Spotify Connect session so you can pair another account",
+                            )
+                            .clicked()
+                    {
+                        commands.push(AppCommand::ResetSoloistPairing);
+                    }
+                });
             });
 
             ui.add_space(12.0);

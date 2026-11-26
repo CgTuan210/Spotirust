@@ -174,6 +174,10 @@ fn default_provider_order() -> Vec<OnlineLyricsProviderId> {
     OnlineLyricsProviderId::default_order()
 }
 
+fn default_soloist_device_name() -> String {
+    "Spotirust".to_string()
+}
+
 /// Persistent user-editable preferences stored in SQLite (`app_settings`).
 /// Note: API keys and OAuth tokens are NEVER stored here; they live exclusively in the OS credential vault.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +202,15 @@ pub struct UserSettings {
     pub local_lyrics_dirs: Vec<PathBuf>,
     pub compact_sidebar: bool,
     pub reduce_motion: bool,
+    /// Spotify Connect device name advertised by the managed Spotify Soloist daemon.
+    #[serde(default = "default_soloist_device_name")]
+    pub soloist_device_name: String,
+    /// Optional explicit path to a user-installed `soloist` / `soloist.exe` binary.
+    #[serde(default)]
+    pub soloist_custom_binary_path: Option<PathBuf>,
+    /// Automatically launch Spotify Soloist on Spotirust startup when both binary & API key are ready.
+    #[serde(default = "default_true")]
+    pub soloist_auto_start: bool,
 }
 
 impl UserSettings {
@@ -230,6 +243,9 @@ impl Default for UserSettings {
             local_lyrics_dirs: Vec::new(),
             compact_sidebar: false,
             reduce_motion: false,
+            soloist_device_name: default_soloist_device_name(),
+            soloist_custom_binary_path: None,
+            soloist_auto_start: true,
         }
     }
 }
@@ -244,6 +260,12 @@ pub struct AppConfig {
     pub artwork_cache_dir: PathBuf,
     pub themes_dir: PathBuf,
     pub lyrics_dir: PathBuf,
+    /// Managed Spotify Soloist executable installation directory (`<data_dir>/soloist/bin`).
+    pub soloist_bin_dir: PathBuf,
+    /// Persistent Spotify Soloist state & paired Connect session directory (`<data_dir>/soloist/data`).
+    pub soloist_data_dir: PathBuf,
+    /// Volatile Spotify Soloist playback cache directory (`<cache_dir>/soloist`).
+    pub soloist_cache_dir: PathBuf,
     /// Maintainer-provided Spotify OAuth Client ID (`SPOTIFY_CLIENT_ID` or `SPOTIRUST_CLIENT_ID`).
     pub spotify_client_id: Option<String>,
     /// Configured loopback redirect URI (`SPOTIFY_REDIRECT_URI`, default `http://127.0.0.1/callback`).
@@ -293,6 +315,9 @@ impl AppConfig {
         let artwork_cache_dir = cache_dir.join("artwork");
         let themes_dir = data_dir.join("themes");
         let lyrics_dir = data_dir.join("lyrics");
+        let soloist_bin_dir = data_dir.join("soloist").join("bin");
+        let soloist_data_dir = data_dir.join("soloist").join("data");
+        let soloist_cache_dir = cache_dir.join("soloist");
 
         let spotify_client_id = resolve_spotify_client_id();
         let resolved_redirect = resolve_redirect_config();
@@ -305,6 +330,9 @@ impl AppConfig {
             artwork_cache_dir,
             themes_dir,
             lyrics_dir,
+            soloist_bin_dir,
+            soloist_data_dir,
+            soloist_cache_dir,
             spotify_client_id,
             oauth_redirect_uri: resolved_redirect.uri,
             oauth_redirect_uri_error: resolved_redirect.error,
@@ -323,6 +351,9 @@ impl AppConfig {
             artwork_cache_dir: cache_dir.join("artwork"),
             themes_dir: data_dir.join("themes"),
             lyrics_dir: data_dir.join("lyrics"),
+            soloist_bin_dir: data_dir.join("soloist").join("bin"),
+            soloist_data_dir: data_dir.join("soloist").join("data"),
+            soloist_cache_dir: cache_dir.join("soloist"),
             data_dir,
             cache_dir,
             spotify_client_id: client_id,
@@ -341,6 +372,9 @@ impl AppConfig {
             &self.artwork_cache_dir,
             &self.themes_dir,
             &self.lyrics_dir,
+            &self.soloist_bin_dir,
+            &self.soloist_data_dir,
+            &self.soloist_cache_dir,
         ] {
             std::fs::create_dir_all(dir)?;
         }
@@ -357,6 +391,17 @@ struct ResolvedRedirectConfig {
 }
 
 fn resolve_spotify_client_id() -> Option<String> {
+    // Allow users running a prebuilt binary to supply their own Spotify Developer Client ID
+    // via environment variable (needed under Spotify's 5-user Dev Mode cap) before falling back
+    // to any maintainer-baked compile-time Client ID.
+    for env_key in ["SPOTIFY_CLIENT_ID", "SPOTIRUST_CLIENT_ID"] {
+        if let Ok(val) = std::env::var(env_key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
     for id in [COMPILE_TIME_SPOTIFY_CLIENT_ID, COMPILE_TIME_CLIENT_ID]
         .into_iter()
         .flatten()
@@ -366,27 +411,19 @@ fn resolve_spotify_client_id() -> Option<String> {
             return Some(trimmed.to_string());
         }
     }
-    for env_key in ["SPOTIFY_CLIENT_ID", "SPOTIRUST_CLIENT_ID"] {
-        if let Ok(val) = std::env::var(env_key) {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
     None
 }
 
 fn resolve_redirect_config() -> ResolvedRedirectConfig {
-    let raw_uri = COMPILE_TIME_SPOTIFY_REDIRECT_URI
-        .map(str::trim)
+    let raw_uri = std::env::var("SPOTIFY_REDIRECT_URI")
+        .ok()
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
         .or_else(|| {
-            std::env::var("SPOTIFY_REDIRECT_URI")
-                .ok()
-                .map(|s| s.trim().to_string())
+            COMPILE_TIME_SPOTIFY_REDIRECT_URI
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
         });
 
     if let Some(uri) = raw_uri {
@@ -432,14 +469,13 @@ fn parse_redirect_uri_or_error(uri: &str) -> ResolvedRedirectConfig {
 }
 
 fn resolve_redirect_port() -> u16 {
-    if let Some(raw) = COMPILE_TIME_REDIRECT_PORT
+    if let Ok(raw) = std::env::var("SPOTIRUST_REDIRECT_PORT")
         && let Ok(port) = raw.trim().parse::<u16>()
     {
         return port;
     }
-    std::env::var("SPOTIRUST_REDIRECT_PORT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok())
+    COMPILE_TIME_REDIRECT_PORT
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
         .unwrap_or(0)
 }
 

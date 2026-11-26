@@ -1,11 +1,14 @@
 //! Unified `PlaybackController` implementing `AudioEngine` with strict mode separation:
-//! 1. **Spotify Connect Remote Controller Mode** (`AudioBackendKind::SpotifyConnect`):
+//! 1. **Spotify Soloist Managed Engine** (`AudioBackendKind::SpotifySoloist`):
+//!    Controls Spotirust's managed local Spotify Soloist headless daemon via official local WebSocket
+//!    API (`--ws 127.0.0.1:0`), allowing Spotify playback even after closing the official Spotify app.
+//! 2. **Spotify Connect Remote Controller Mode** (`AudioBackendKind::SpotifyConnect`):
 //!    Controls an active external Spotify Connect device via official `/me/player/*` endpoints.
 //!    NEVER sets `PlaybackStatus::Playing` before the target Connect device confirms playback via `GET /me/player`.
-//! 2. **Local Music Player Mode** (`AudioBackendKind::LocalRodio`):
+//! 3. **Local Music Player Mode** (`AudioBackendKind::LocalRodio`):
 //!    Plays real local audio files (`MP3`, `FLAC`, `OGG`, `WAV`) natively via `rodio 0.21`.
 //!    NEVER fakes a moving progress bar when no audio file or OS audio output device is active.
-//! 3. **Optional Librespot 0.8 Backend** (`AudioBackendKind::Librespot`, behind `--features librespot-backend`):
+//! 4. **Optional Librespot 0.8 Backend** (`AudioBackendKind::Librespot`, behind `--features librespot-backend`):
 //!    Honest status reporting (blocked for third-party OAuth tokens since Aug 2026, `librespot#1737`).
 
 use crate::audio::clock::{ClockSyncOutcome, PlaybackClock};
@@ -18,10 +21,12 @@ use crate::audio::events::{PlaybackEvent, PlaybackEventBus};
 use crate::audio::librespot_engine::LibrespotEngine;
 use crate::audio::local_rodio::LocalRodioPlayer;
 use crate::audio::queue::PlaybackQueue;
-use crate::core::models::{AudioBackendKind, Track};
+use crate::audio::soloist::{SoloistEngine, SoloistEvent, SoloistStatus};
+use crate::core::models::{AudioBackendKind, RepeatMode, Track};
 use crate::spotify::client::SpotifyClient;
 use crate::storage::database::{Database, PlaybackPreferences};
 use async_trait::async_trait;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -39,6 +44,7 @@ struct InnerPlaybackState {
     active_backend: AudioBackendKind,
     active_device_name: Option<String>,
     active_device_type: Option<String>,
+    soloist_owns_queue: bool,
     last_connect_poll: Instant,
 }
 
@@ -48,6 +54,7 @@ pub struct PlaybackController {
     state: Arc<RwLock<InnerPlaybackState>>,
     events: PlaybackEventBus,
     connect: Option<SpotifyConnectEngine>,
+    soloist: SoloistEngine,
     local_player: LocalRodioPlayer,
     #[cfg(feature = "librespot-backend")]
     librespot: LibrespotEngine,
@@ -59,6 +66,21 @@ impl PlaybackController {
         spotify_client: Option<SpotifyClient>,
         db: Option<Database>,
         events: PlaybackEventBus,
+    ) -> Self {
+        let fallback_root = std::env::temp_dir().join("spotirust-soloist-ephemeral");
+        let soloist = SoloistEngine::new(
+            fallback_root.join("bin"),
+            fallback_root.join("data"),
+            fallback_root.join("cache"),
+        );
+        Self::with_soloist(spotify_client, db, events, soloist)
+    }
+
+    pub fn with_soloist(
+        spotify_client: Option<SpotifyClient>,
+        db: Option<Database>,
+        events: PlaybackEventBus,
+        soloist: SoloistEngine,
     ) -> Self {
         let restored = db
             .as_ref()
@@ -128,6 +150,7 @@ impl PlaybackController {
             active_backend: restored.backend_kind,
             active_device_name: None,
             active_device_type: None,
+            soloist_owns_queue: true,
             last_connect_poll: Instant::now() - Duration::from_secs(10),
         };
 
@@ -135,6 +158,7 @@ impl PlaybackController {
             state: Arc::new(RwLock::new(state)),
             events,
             connect,
+            soloist,
             local_player,
             #[cfg(feature = "librespot-backend")]
             librespot,
@@ -147,8 +171,332 @@ impl PlaybackController {
         Self::new(None, None, PlaybackEventBus::default())
     }
 
+    pub fn for_testing_with_soloist(soloist_root: PathBuf) -> Self {
+        let soloist = SoloistEngine::new(
+            soloist_root.join("bin"),
+            soloist_root.join("data"),
+            soloist_root.join("cache"),
+        );
+        Self::with_soloist(None, None, PlaybackEventBus::default(), soloist)
+    }
+
+    pub fn soloist(&self) -> &SoloistEngine {
+        &self.soloist
+    }
+
     pub fn event_bus(&self) -> &PlaybackEventBus {
         &self.events
+    }
+
+    /// Spawn the real-time event consumer bridging Spotify Soloist's local WebSocket stream
+    /// into `PlaybackController`, `PlaybackClock`, and UI/MPRIS snapshots (zero HTTP polling).
+    pub fn spawn_soloist_event_listener(&self) -> tokio::task::JoinHandle<()> {
+        let ctrl = self.clone();
+        let mut rx = self.soloist.subscribe();
+        tokio::spawn(async move {
+            while let Ok(evt) = rx.recv().await {
+                ctrl.handle_soloist_event(evt).await;
+            }
+        })
+    }
+
+    async fn handle_soloist_event(&self, evt: SoloistEvent) {
+        match evt {
+            SoloistEvent::PlaybackState(st) => {
+                let device_name = self.soloist.device_name().await;
+                let track = st.item.as_ref().and_then(|i| i.into_track());
+                let dur_ms = track.as_ref().map(|t| t.duration_ms).unwrap_or(0);
+                let est_ms = st.position.estimated_ms_now();
+                let is_playing = st.status.eq_ignore_ascii_case("playing");
+                let is_buffering = st.status.eq_ignore_ascii_case("buffering");
+
+                let mut track_changed: Option<Track> = None;
+                let mut should_emit = false;
+                {
+                    let mut guard = self.state.write().await;
+                    let take_over = guard.active_backend == AudioBackendKind::SpotifySoloist
+                        || guard.preferred_backend == AudioBackendKind::SpotifySoloist
+                        || (st.is_active && is_playing);
+                    if take_over {
+                        if st.is_active && is_playing && self.local_player.has_active_sink() {
+                            self.local_player.pause();
+                        }
+                        guard.active_backend = AudioBackendKind::SpotifySoloist;
+                        let track_id = track.as_ref().map(|t| t.id.as_str());
+                        guard.clock.reconcile_remote(
+                            track_id,
+                            est_ms,
+                            dur_ms,
+                            is_playing,
+                            Duration::ZERO,
+                        );
+                        guard.status = if is_playing {
+                            PlaybackStatus::Playing
+                        } else if is_buffering {
+                            PlaybackStatus::Loading
+                        } else if track.is_some() && !st.status.eq_ignore_ascii_case("idle") {
+                            PlaybackStatus::Paused
+                        } else {
+                            PlaybackStatus::Stopped
+                        };
+                        guard.active_device_name = Some(device_name);
+                        guard.active_device_type = Some("Soloist".to_string());
+                        guard.volume = (f32::from(st.volume) / 100.0).clamp(0.0, 1.0);
+                        guard.queue.shuffle = st.options.shuffle;
+                        guard.queue.repeat = RepeatMode::from_db_str(&st.options.repeat);
+
+                        if let Some(rt) = &track {
+                            let cur_id = guard.queue.current().map(|t| t.id.as_str());
+                            if cur_id != Some(rt.id.as_str()) {
+                                let found_idx = guard
+                                    .queue
+                                    .items_in_playback_order()
+                                    .iter()
+                                    .position(|t| t.id == rt.id || t.uri == rt.uri);
+                                if let Some(idx) = found_idx {
+                                    guard.queue.jump_to(idx);
+                                } else {
+                                    guard.queue.set_context(vec![rt.clone()], Some(&rt.id));
+                                }
+                                track_changed = Some(rt.clone());
+                            }
+                        }
+                        should_emit = true;
+                    }
+                }
+                if let Some(ref t) = track_changed {
+                    if is_playing && let Some(db) = &self.db {
+                        let _ = db.record_recently_played(t, None);
+                    }
+                    self.events
+                        .publish(PlaybackEvent::TrackChanged(Some(t.clone())));
+                }
+                if should_emit {
+                    self.emit_snapshot().await;
+                }
+            }
+            SoloistEvent::TrackChanged(opt_track) => {
+                let mut changed_track = None;
+                let mut emit = false;
+                {
+                    let mut guard = self.state.write().await;
+                    if (guard.active_backend == AudioBackendKind::SpotifySoloist
+                        || guard.preferred_backend == AudioBackendKind::SpotifySoloist)
+                        && let Some(rt) = opt_track
+                    {
+                        let cur_id = guard.queue.current().map(|t| t.id.as_str());
+                        if cur_id != Some(rt.id.as_str()) {
+                            let found_idx = guard
+                                .queue
+                                .items_in_playback_order()
+                                .iter()
+                                .position(|t| t.id == rt.id || t.uri == rt.uri);
+                            if let Some(idx) = found_idx {
+                                guard.queue.jump_to(idx);
+                            } else {
+                                guard.queue.set_context(vec![rt.clone()], Some(&rt.id));
+                            }
+                            let is_playing = guard.status.is_playing();
+                            guard.clock.on_track_change(
+                                Some(rt.id.clone()),
+                                rt.duration_ms,
+                                0,
+                                is_playing,
+                            );
+                            changed_track = Some(rt);
+                        }
+                        emit = true;
+                    }
+                }
+                if let Some(t) = changed_track {
+                    if let Some(db) = &self.db {
+                        let _ = db.record_recently_played(&t, None);
+                    }
+                    self.events.publish(PlaybackEvent::TrackChanged(Some(t)));
+                }
+                if emit {
+                    self.emit_snapshot().await;
+                }
+            }
+            SoloistEvent::PlaybackStatusChanged(status_str) => {
+                let mut emit = false;
+                {
+                    let mut guard = self.state.write().await;
+                    if guard.active_backend == AudioBackendKind::SpotifySoloist
+                        || guard.preferred_backend == AudioBackendKind::SpotifySoloist
+                    {
+                        if status_str.eq_ignore_ascii_case("playing") {
+                            guard.active_backend = AudioBackendKind::SpotifySoloist;
+                            let cur_id = guard.queue.current().map(|t| t.id.clone());
+                            let pos_ms = guard.clock.position_ms();
+                            let dur = guard.clock.duration_ms();
+                            guard.clock.reconcile_remote(
+                                cur_id.as_deref(),
+                                pos_ms,
+                                dur,
+                                true,
+                                Duration::ZERO,
+                            );
+                            guard.status = PlaybackStatus::Playing;
+                        } else if status_str.eq_ignore_ascii_case("paused") {
+                            guard.clock.on_pause(None);
+                            guard.status = PlaybackStatus::Paused;
+                        } else if status_str.eq_ignore_ascii_case("buffering") {
+                            guard.status = PlaybackStatus::Loading;
+                        } else if status_str.eq_ignore_ascii_case("idle") {
+                            guard.clock.on_pause(None);
+                            guard.status = PlaybackStatus::Stopped;
+                        }
+                        emit = true;
+                    }
+                }
+                if emit {
+                    self.emit_snapshot().await;
+                }
+            }
+            SoloistEvent::PositionSync(pos) => {
+                let est_ms = pos.estimated_ms_now();
+                let advancing = pos.speed > 0.0;
+                let mut emit = false;
+                {
+                    let mut guard = self.state.write().await;
+                    if guard.active_backend == AudioBackendKind::SpotifySoloist {
+                        let cur_id = guard.queue.current().map(|t| t.id.clone());
+                        let dur = guard.clock.duration_ms();
+                        if advancing && (pos.speed - guard.clock.playback_speed()).abs() > 0.01 {
+                            guard.clock.set_playback_speed_at(pos.speed, Instant::now());
+                        }
+                        guard.clock.reconcile_remote(
+                            cur_id.as_deref(),
+                            est_ms,
+                            dur,
+                            advancing,
+                            Duration::ZERO,
+                        );
+                        if advancing {
+                            guard.status = PlaybackStatus::Playing;
+                        }
+                        emit = true;
+                    }
+                }
+                if emit {
+                    self.emit_snapshot().await;
+                }
+            }
+            SoloistEvent::VolumeChanged(vol) => {
+                let clamped = (f32::from(vol) / 100.0).clamp(0.0, 1.0);
+                let mut emit = false;
+                {
+                    let mut guard = self.state.write().await;
+                    if guard.active_backend == AudioBackendKind::SpotifySoloist {
+                        guard.volume = clamped;
+                        emit = true;
+                    }
+                }
+                if emit {
+                    self.events
+                        .publish(PlaybackEvent::VolumeChanged { volume: clamped });
+                    self.emit_snapshot().await;
+                }
+            }
+            SoloistEvent::OptionsChanged(opts) => {
+                let mut emit = false;
+                {
+                    let mut guard = self.state.write().await;
+                    if guard.active_backend == AudioBackendKind::SpotifySoloist {
+                        guard.queue.shuffle = opts.shuffle;
+                        guard.queue.repeat = RepeatMode::from_db_str(&opts.repeat);
+                        emit = true;
+                    }
+                }
+                if emit {
+                    self.emit_queue_and_persist().await;
+                    self.emit_snapshot().await;
+                }
+            }
+            SoloistEvent::QueueChanged { upcoming } => {
+                let mut emit = false;
+                {
+                    let mut guard = self.state.write().await;
+                    if guard.active_backend == AudioBackendKind::SpotifySoloist {
+                        let mut combined = Vec::new();
+                        let cur_id = guard.queue.current().map(|t| t.id.clone());
+                        if let Some(cur) = guard.queue.current().cloned() {
+                            combined.push(cur);
+                        }
+                        combined.extend(upcoming);
+                        if !combined.is_empty() {
+                            guard.queue.set_context(combined, cur_id.as_deref());
+                            emit = true;
+                        }
+                    }
+                }
+                if emit {
+                    self.emit_queue_and_persist().await;
+                }
+            }
+            SoloistEvent::DeviceChanged {
+                is_active,
+                device_name,
+            } => {
+                let mut emit = false;
+                {
+                    let mut guard = self.state.write().await;
+                    if guard.active_backend == AudioBackendKind::SpotifySoloist {
+                        if !device_name.trim().is_empty() {
+                            guard.active_device_name = Some(device_name);
+                            guard.active_device_type = Some("Soloist".to_string());
+                        }
+                        if !is_active && guard.status.is_playing() {
+                            guard.clock.on_pause(None);
+                            guard.status = PlaybackStatus::Paused;
+                        }
+                        emit = true;
+                    }
+                }
+                if emit {
+                    self.emit_snapshot().await;
+                }
+            }
+            SoloistEvent::RuntimeChanged(snap) => {
+                let mut emit = false;
+                {
+                    let mut guard = self.state.write().await;
+                    if guard.active_backend == AudioBackendKind::SpotifySoloist {
+                        match &snap.status {
+                            SoloistStatus::Connected { device_name, .. } => {
+                                guard.active_device_name = Some(device_name.clone());
+                                guard.active_device_type = Some("Soloist".to_string());
+                                emit = true;
+                            }
+                            SoloistStatus::Stopped => {
+                                if guard.status.is_playing() {
+                                    guard.clock.on_disconnected();
+                                    guard.status = PlaybackStatus::Stopped;
+                                }
+                                guard.active_device_name = None;
+                                guard.active_device_type = None;
+                                emit = true;
+                            }
+                            SoloistStatus::Expired { message }
+                            | SoloistStatus::Error { message } => {
+                                guard.clock.on_disconnected();
+                                guard.status = PlaybackStatus::Error(message.clone());
+                                emit = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if emit {
+                    self.emit_snapshot().await;
+                }
+            }
+            SoloistEvent::ApiError(msg) => {
+                self.events
+                    .publish(PlaybackEvent::Error(format!("Spotify Soloist: {msg}")));
+            }
+        }
     }
 
     pub async fn snapshot(&self) -> PlaybackSnapshot {
@@ -173,7 +521,8 @@ impl PlaybackController {
         }
     }
 
-    /// Switch the user's explicit operating mode between Spotify Connect Remote and Local Player.
+    /// Switch the user's explicit operating mode between Spotify Soloist, Spotify Connect Remote,
+    /// and Local Player.
     pub async fn set_preferred_backend(&self, kind: AudioBackendKind) {
         if kind != AudioBackendKind::LocalRodio && self.local_player.has_active_sink() {
             self.local_player.pause();
@@ -182,18 +531,37 @@ impl PlaybackController {
             let mut guard = self.state.write().await;
             guard.preferred_backend = kind;
             guard.active_backend = kind;
-            if kind == AudioBackendKind::LocalRodio {
-                guard.active_device_name = None;
-                guard.active_device_type = None;
-                if !self.local_player.has_active_sink() {
+            match kind {
+                AudioBackendKind::LocalRodio => {
+                    guard.active_device_name = None;
+                    guard.active_device_type = None;
+                    if !self.local_player.has_active_sink() {
+                        guard.status = PlaybackStatus::Stopped;
+                        guard.clock.on_pause(None);
+                    }
+                }
+                AudioBackendKind::SpotifySoloist => {
                     guard.status = PlaybackStatus::Stopped;
                     guard.clock.on_pause(None);
                 }
-            } else {
-                guard.status = PlaybackStatus::Stopped;
-                guard.clock.on_pause(None);
+                AudioBackendKind::SpotifyConnect | AudioBackendKind::Librespot => {
+                    guard.status = PlaybackStatus::Stopped;
+                    guard.clock.on_pause(None);
+                }
             }
         }
+
+        if kind == AudioBackendKind::SpotifySoloist && self.soloist.is_ready().await {
+            let name = self.soloist.device_name().await;
+            {
+                let mut guard = self.state.write().await;
+                guard.active_device_name = Some(name);
+                guard.active_device_type = Some("Soloist".to_string());
+            }
+            let _ = self.soloist.request_state().await;
+            let _ = self.soloist.request_queue(50).await;
+        }
+
         self.persist_preferences().await;
         self.emit_snapshot().await;
 
@@ -342,6 +710,7 @@ impl PlaybackController {
 
         {
             let mut guard = self.state.write().await;
+            guard.soloist_owns_queue = tracks.len() <= 1;
             guard.queue.set_context(tracks, Some(&track.id));
         }
         self.start_current_track().await
@@ -349,6 +718,11 @@ impl PlaybackController {
 
     pub async fn add_to_queue(&self, track: Track) -> Result<(), AudioError> {
         let active_backend = self.state.read().await.active_backend;
+        if active_backend == AudioBackendKind::SpotifySoloist && track.uri.starts_with("spotify:") {
+            self.soloist.add_to_queue(&track.uri).await?;
+            let _ = self.soloist.request_queue(50).await;
+            return Ok(());
+        }
         if active_backend == AudioBackendKind::SpotifyConnect
             && track.uri.starts_with("spotify:")
             && let Some(connect) = &self.connect
@@ -410,6 +784,11 @@ impl PlaybackController {
             AudioBackendKind::LocalRodio => {
                 self.local_player.stop();
             }
+            AudioBackendKind::SpotifySoloist => {
+                if self.soloist.is_ready().await {
+                    let _ = self.soloist.pause().await;
+                }
+            }
             AudioBackendKind::SpotifyConnect => {
                 if let Some(connect) = &self.connect
                     && connect.is_authenticated().await
@@ -463,7 +842,10 @@ impl PlaybackController {
             _ => {
                 if has_track {
                     self.start_current_track().await
-                } else if active_backend == AudioBackendKind::SpotifyConnect {
+                } else if matches!(
+                    active_backend,
+                    AudioBackendKind::SpotifyConnect | AudioBackendKind::SpotifySoloist
+                ) {
                     self.resume().await
                 } else {
                     Ok(())
@@ -473,17 +855,20 @@ impl PlaybackController {
     }
 
     pub async fn toggle_shuffle(&self) {
-        let (enabled, is_connect) = {
+        let (enabled, backend) = {
             let mut guard = self.state.write().await;
             let next = !guard.queue.shuffle;
-            let is_connect = guard.active_backend == AudioBackendKind::SpotifyConnect;
-            if !is_connect {
+            let backend = guard.active_backend;
+            if !matches!(
+                backend,
+                AudioBackendKind::SpotifyConnect | AudioBackendKind::SpotifySoloist
+            ) {
                 guard.queue.set_shuffle(next);
             }
-            (next, is_connect)
+            (next, backend)
         };
-        if is_connect && let Some(connect) = &self.connect {
-            match connect.set_shuffle_remote(enabled).await {
+        match backend {
+            AudioBackendKind::SpotifySoloist => match self.soloist.set_shuffle(enabled).await {
                 Ok(()) => {
                     let mut guard = self.state.write().await;
                     guard.queue.set_shuffle(enabled);
@@ -491,24 +876,41 @@ impl PlaybackController {
                 Err(err) => {
                     self.events.publish(PlaybackEvent::Error(err.to_string()));
                 }
+            },
+            AudioBackendKind::SpotifyConnect => {
+                if let Some(connect) = &self.connect {
+                    match connect.set_shuffle_remote(enabled).await {
+                        Ok(()) => {
+                            let mut guard = self.state.write().await;
+                            guard.queue.set_shuffle(enabled);
+                        }
+                        Err(err) => {
+                            self.events.publish(PlaybackEvent::Error(err.to_string()));
+                        }
+                    }
+                }
             }
+            _ => {}
         }
         self.emit_queue_and_persist().await;
         self.emit_snapshot().await;
     }
 
     pub async fn cycle_repeat(&self) {
-        let (repeat, is_connect) = {
+        let (repeat, backend) = {
             let mut guard = self.state.write().await;
             let next = guard.queue.repeat.cycle();
-            let is_connect = guard.active_backend == AudioBackendKind::SpotifyConnect;
-            if !is_connect {
+            let backend = guard.active_backend;
+            if !matches!(
+                backend,
+                AudioBackendKind::SpotifyConnect | AudioBackendKind::SpotifySoloist
+            ) {
                 guard.queue.set_repeat(next);
             }
-            (next, is_connect)
+            (next, backend)
         };
-        if is_connect && let Some(connect) = &self.connect {
-            match connect.set_repeat_remote(repeat).await {
+        match backend {
+            AudioBackendKind::SpotifySoloist => match self.soloist.set_repeat(repeat).await {
                 Ok(()) => {
                     let mut guard = self.state.write().await;
                     guard.queue.set_repeat(repeat);
@@ -516,7 +918,21 @@ impl PlaybackController {
                 Err(err) => {
                     self.events.publish(PlaybackEvent::Error(err.to_string()));
                 }
+            },
+            AudioBackendKind::SpotifyConnect => {
+                if let Some(connect) = &self.connect {
+                    match connect.set_repeat_remote(repeat).await {
+                        Ok(()) => {
+                            let mut guard = self.state.write().await;
+                            guard.queue.set_repeat(repeat);
+                        }
+                        Err(err) => {
+                            self.events.publish(PlaybackEvent::Error(err.to_string()));
+                        }
+                    }
+                }
             }
+            _ => {}
         }
         self.emit_queue_and_persist().await;
         self.emit_snapshot().await;
@@ -527,6 +943,7 @@ impl PlaybackController {
     /// - Spotify Connect mode: polls `GET /me/player` at most once every 2.5 seconds when authenticated,
     ///   reconciles drift via `PlaybackClock`, honors HTTP 429 `Retry-After` cooldowns without spamming,
     ///   marks clock stale on repeated poll failures/timeouts, and detects device disconnection mid-playback.
+    /// - Spotify Soloist mode: event-driven over local WebSocket (zero polling cost).
     pub async fn tick_background(&self) {
         let (active_backend, preferred_backend, is_playing, should_poll_connect) = {
             let guard = self.state.read().await;
@@ -698,9 +1115,15 @@ impl PlaybackController {
         }
         let pref = self.state.read().await.preferred_backend;
         match pref {
+            AudioBackendKind::SpotifySoloist => AudioBackendKind::SpotifySoloist,
             AudioBackendKind::Librespot => AudioBackendKind::Librespot,
-            AudioBackendKind::SpotifyConnect | AudioBackendKind::LocalRodio => {
-                AudioBackendKind::SpotifyConnect
+            AudioBackendKind::SpotifyConnect => AudioBackendKind::SpotifyConnect,
+            AudioBackendKind::LocalRodio => {
+                if self.soloist.is_ready().await {
+                    AudioBackendKind::SpotifySoloist
+                } else {
+                    AudioBackendKind::SpotifyConnect
+                }
             }
         }
     }
@@ -781,6 +1204,25 @@ impl PlaybackController {
                     }
                 }
             }
+            AudioBackendKind::SpotifySoloist => {
+                if let Err(err) = self.soloist.play(&track.uri).await {
+                    self.record_error(&err).await;
+                    return Err(err);
+                }
+                let dev_name = self.soloist.device_name().await;
+                {
+                    let mut guard = self.state.write().await;
+                    guard.active_device_name = Some(dev_name);
+                    guard.active_device_type = Some("Soloist".to_string());
+                }
+                self.events
+                    .publish(PlaybackEvent::TrackChanged(Some(track)));
+                self.emit_queue_and_persist().await;
+                self.emit_snapshot().await;
+                // Soloist confirms actual Playing status asynchronously over local WebSocket
+                // (`playback_state` / `playback_changed` / `position_sync`).
+                Ok(())
+            }
             AudioBackendKind::SpotifyConnect => {
                 let Some(connect) = &self.connect else {
                     let err = AudioError::Unauthenticated;
@@ -848,7 +1290,7 @@ impl PlaybackController {
                 {
                     if !self.librespot.is_connected().await {
                         let err = AudioError::BackendUnavailable(
-                            "Librespot direct playback is blocked for third-party OAuth tokens since Aug 2026 (librespot#1737). Use Spotify Connect Remote or Local Player instead."
+                            "Librespot direct playback is blocked for third-party OAuth tokens since Aug 2026 (librespot#1737). Use Spotify Soloist, Spotify Connect, or Local Player instead."
                                 .to_string(),
                         );
                         self.record_error(&err).await;
@@ -865,7 +1307,7 @@ impl PlaybackController {
                 #[cfg(not(feature = "librespot-backend"))]
                 {
                     let err = AudioError::BackendUnavailable(
-                        "Librespot is not compiled in this build (and third-party OAuth login5 is blocked since Aug 2026, librespot#1737). Use Spotify Connect Remote or Local Player."
+                        "Librespot is not compiled in this build (and third-party OAuth login5 is blocked since Aug 2026, librespot#1737). Use Spotify Soloist, Spotify Connect, or Local Player."
                             .to_string(),
                     );
                     self.record_error(&err).await;
@@ -1070,6 +1512,20 @@ impl AudioEngine for PlaybackController {
                 self.emit_snapshot().await;
                 Ok(())
             }
+            AudioBackendKind::SpotifySoloist => {
+                if let Err(err) = self.soloist.pause().await {
+                    self.record_error(&err).await;
+                    return Err(err);
+                }
+                {
+                    let mut guard = self.state.write().await;
+                    guard.clock.on_pause(None);
+                    guard.status = PlaybackStatus::Paused;
+                }
+                self.persist_preferences().await;
+                self.emit_snapshot().await;
+                Ok(())
+            }
             AudioBackendKind::SpotifyConnect => {
                 let Some(connect) = &self.connect else {
                     return Err(AudioError::Unauthenticated);
@@ -1157,6 +1613,19 @@ impl AudioEngine for PlaybackController {
                     self.record_error(&err).await;
                     Err(err)
                 }
+            }
+            AudioBackendKind::SpotifySoloist => {
+                {
+                    let mut guard = self.state.write().await;
+                    guard.status = PlaybackStatus::Loading;
+                    guard.clock.on_pause(None);
+                }
+                self.emit_snapshot().await;
+                if let Err(err) = self.soloist.resume().await {
+                    self.record_error(&err).await;
+                    return Err(err);
+                }
+                Ok(())
             }
             AudioBackendKind::SpotifyConnect => {
                 let Some(connect) = &self.connect else {
@@ -1254,6 +1723,14 @@ impl AudioEngine for PlaybackController {
                     );
                 }
             }
+            AudioBackendKind::SpotifySoloist => {
+                if let Err(err) = self.soloist.seek(clamped).await {
+                    self.record_error(&err).await;
+                    return Err(err);
+                }
+                let mut guard = self.state.write().await;
+                guard.clock.on_seek(clamped);
+            }
             AudioBackendKind::SpotifyConnect => {
                 let Some(connect) = &self.connect else {
                     return Err(AudioError::Unauthenticated);
@@ -1293,6 +1770,12 @@ impl AudioEngine for PlaybackController {
         let backend = self.state.read().await.active_backend;
         match backend {
             AudioBackendKind::LocalRodio => self.local_player.set_volume(clamped),
+            AudioBackendKind::SpotifySoloist => {
+                if let Err(err) = self.soloist.set_volume(clamped).await {
+                    self.events.publish(PlaybackEvent::Error(err.to_string()));
+                    return Err(err);
+                }
+            }
             AudioBackendKind::SpotifyConnect => {
                 let Some(connect) = &self.connect else {
                     return Err(AudioError::Unauthenticated);
@@ -1338,6 +1821,31 @@ impl AudioEngine for PlaybackController {
             return self.sync_connect_now().await;
         }
 
+        if backend == AudioBackendKind::SpotifySoloist {
+            let has_local_context_next = {
+                let mut guard = self.state.write().await;
+                if !guard.soloist_owns_queue && guard.queue.items_in_playback_order().len() > 1 {
+                    let prev_repeat = guard.queue.repeat;
+                    if prev_repeat == RepeatMode::Track {
+                        guard.queue.repeat = RepeatMode::Off;
+                    }
+                    let moved = guard.queue.next_track().is_some();
+                    guard.queue.repeat = prev_repeat;
+                    moved
+                } else {
+                    false
+                }
+            };
+            if has_local_context_next {
+                return self.start_current_track().await;
+            }
+            if let Err(err) = self.soloist.next().await {
+                self.record_error(&err).await;
+                return Err(err);
+            }
+            return Ok(());
+        }
+
         let has_next = {
             let mut guard = self.state.write().await;
             guard.queue.next_track().is_some()
@@ -1370,6 +1878,25 @@ impl AudioEngine for PlaybackController {
             }
             tokio::time::sleep(Duration::from_millis(120)).await;
             return self.sync_connect_now().await;
+        }
+
+        if backend == AudioBackendKind::SpotifySoloist {
+            let has_local_context_prev = {
+                let mut guard = self.state.write().await;
+                if !guard.soloist_owns_queue && guard.queue.items_in_playback_order().len() > 1 {
+                    guard.queue.previous_track().is_some()
+                } else {
+                    false
+                }
+            };
+            if has_local_context_prev {
+                return self.start_current_track().await;
+            }
+            if let Err(err) = self.soloist.previous().await {
+                self.record_error(&err).await;
+                return Err(err);
+            }
+            return Ok(());
         }
 
         let has_prev = {

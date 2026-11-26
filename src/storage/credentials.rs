@@ -12,6 +12,7 @@ use thiserror::Error;
 pub const KEYRING_SERVICE: &str = "com.spotirust.desktop";
 pub const KEYRING_OAUTH_ACCOUNT: &str = "spotify_oauth_session";
 pub const KEYRING_MUSIXMATCH_ACCOUNT: &str = "musixmatch_official_api_key";
+pub const KEYRING_SOLOIST_ACCOUNT: &str = "spotify_soloist_api_key";
 
 /// Load an optional user-supplied official Musixmatch Developer API key from the OS credential vault.
 /// Falls back cleanly to `None` if no key is stored or the OS keyring is unavailable.
@@ -40,6 +41,42 @@ pub fn save_musixmatch_api_key(key: &str) -> Result<(), CredentialError> {
 /// Remove any saved Musixmatch API key from the OS credential vault.
 pub fn delete_musixmatch_api_key() -> Result<(), CredentialError> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_MUSIXMATCH_ACCOUNT)
+        .map_err(|e| CredentialError::Backend(e.to_string()))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(keyring::Error::NoDefaultStore) => Ok(()),
+        Err(e) => Err(CredentialError::Backend(e.to_string())),
+    }
+}
+
+/// Load the user's personal Spotify Soloist API key from the OS credential vault.
+/// Falls back cleanly to `None` if not stored or if the OS keyring is unavailable.
+pub fn load_soloist_api_key() -> Option<String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_SOLOIST_ACCOUNT).ok()?;
+    entry
+        .get_password()
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Save the user's personal Spotify Soloist API key strictly inside the OS credential vault
+/// (never written to SQLite or plaintext config files).
+pub fn save_soloist_api_key(key: &str) -> Result<(), CredentialError> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return delete_soloist_api_key();
+    }
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_SOLOIST_ACCOUNT)
+        .map_err(|e| CredentialError::Backend(e.to_string()))?;
+    entry
+        .set_password(trimmed)
+        .map_err(|e| CredentialError::Backend(e.to_string()))
+}
+
+/// Remove any saved Spotify Soloist API key from the OS credential vault.
+pub fn delete_soloist_api_key() -> Result<(), CredentialError> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_SOLOIST_ACCOUNT)
         .map_err(|e| CredentialError::Backend(e.to_string()))?;
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),

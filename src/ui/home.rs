@@ -2,6 +2,7 @@
 //! Recently Played, Made For You / Top Tracks, Recommended Playlists, Saved Albums,
 //! and Spotirust Soundcheck (offline word-by-word karaoke showcase).
 
+use crate::audio::soloist::SoloistStatus;
 use crate::core::events::AppCommand;
 use crate::core::models::Route;
 use crate::core::state::{AppState, AuthUiState};
@@ -41,6 +42,9 @@ pub fn render_home(
             if !matches!(state.auth, AuthUiState::Authenticated(_)) {
                 render_auth_hero(ui, state, theme, commands);
                 ui.add_space(18.0);
+            } else if !state.soloist.logged_in {
+                render_soloist_banner(ui, state, theme, commands);
+                ui.add_space(14.0);
             }
 
             // Recently Played section
@@ -327,6 +331,128 @@ fn render_auth_hero(
                         }
                         AuthUiState::Authenticated(_) => {}
                     }
+                });
+            });
+        });
+}
+
+fn render_soloist_banner(
+    ui: &mut Ui,
+    state: &mut AppState,
+    theme: &ThemePalette,
+    commands: &mut Vec<AppCommand>,
+) {
+    let (accent_color, heading, detail) = match &state.soloist.status {
+        SoloistStatus::WaitingForPairing { device_name, .. } => (
+            theme.accent,
+            format!("Pair Spotify Soloist once: select '{device_name}' in Spotify"),
+            format!(
+                "Open the official Spotify app (phone or desktop on the same Wi-Fi) and pick '{device_name}' \
+                 in Connect devices. After that one-time handshake, you can close the official Spotify app permanently."
+            ),
+        ),
+        SoloistStatus::Expired { message } => (
+            theme.warning,
+            "Spotify Soloist build expired (90-day limit)".to_string(),
+            message.clone(),
+        ),
+        SoloistStatus::Downloading => (
+            theme.accent,
+            "Downloading official Spotify Soloist binary…".to_string(),
+            "Fetching the official prebuilt archive directly from Spotify's CDN and verifying its executable header."
+                .to_string(),
+        ),
+        SoloistStatus::Starting => (
+            theme.accent,
+            "Starting Spotify Soloist engine…".to_string(),
+            "Launching local headless playback engine on 127.0.0.1 and waiting for its WebSocket handshake."
+                .to_string(),
+        ),
+        SoloistStatus::Error { message } => (
+            theme.danger,
+            "Spotify Soloist needs attention".to_string(),
+            message.clone(),
+        ),
+        _ => (
+            theme.border,
+            "Play Spotify directly without keeping the official Spotify app open".to_string(),
+            "Enable Spotify Soloist in Settings (Spotify's official headless engine, requires Premium) \
+             so Spotirust plays full Spotify tracks natively even after you close the official Spotify app."
+                .to_string(),
+        ),
+    };
+
+    Frame::new()
+        .fill(theme.bg_elevated)
+        .corner_radius(CornerRadius::same(12))
+        .stroke(Stroke::new(1.0, accent_color))
+        .inner_margin(Margin::same(14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                if matches!(
+                    state.soloist.status,
+                    SoloistStatus::Downloading | SoloistStatus::Starting
+                ) {
+                    ui.spinner();
+                }
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(heading)
+                            .size(14.5)
+                            .strong()
+                            .color(theme.text_primary),
+                    );
+                    ui.add_space(3.0);
+                    ui.label(RichText::new(detail).size(12.0).color(theme.text_secondary));
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let primary_label = match state.soloist.status {
+                            SoloistStatus::WaitingForPairing { .. }
+                            | SoloistStatus::Downloading
+                            | SoloistStatus::Starting => "Soloist Settings",
+                            SoloistStatus::Expired { .. } => "Update Soloist",
+                            _ if state.soloist.api_key_configured
+                                && state.soloist.binary_path.is_some() =>
+                            {
+                                "Start Soloist"
+                            }
+                            _ => "Set up Spotify Soloist",
+                        };
+
+                        let btn = egui::Button::new(
+                            RichText::new(primary_label)
+                                .strong()
+                                .size(12.5)
+                                .color(Color32::BLACK),
+                        )
+                        .fill(theme.accent)
+                        .corner_radius(CornerRadius::same(16))
+                        .min_size(Vec2::new(150.0, 30.0));
+
+                        if ui.add(btn).clicked() {
+                            match state.soloist.status {
+                                SoloistStatus::Expired { .. } => {
+                                    commands.push(AppCommand::DownloadSoloist);
+                                }
+                                SoloistStatus::Stopped | SoloistStatus::Error { .. }
+                                    if state.soloist.api_key_configured
+                                        && state.soloist.binary_path.is_some() =>
+                                {
+                                    commands.push(AppCommand::StartSoloist);
+                                }
+                                _ => {
+                                    state.navigate(Route::Settings);
+                                }
+                            }
+                        }
+
+                        if primary_label != "Soloist Settings"
+                            && ui.button("Open Settings").clicked()
+                        {
+                            state.navigate(Route::Settings);
+                        }
+                    });
                 });
             });
         });

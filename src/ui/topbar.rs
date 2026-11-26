@@ -175,7 +175,7 @@ pub fn render_topbar(
                 });
             }
 
-            // Explicit Mode Switcher: Spotify Connect Remote vs Local Music Player (Rodio)
+            // Explicit Mode Switcher: Local Music Player | Spotify Soloist | Spotify Connect Remote
             let active_mode = state.playback.backend;
             Frame::new()
                 .fill(theme.bg_elevated)
@@ -186,6 +186,8 @@ pub fn render_topbar(
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 3.0;
                         let is_local = active_mode == crate::core::models::AudioBackendKind::LocalRodio;
+                        let is_soloist =
+                            active_mode == crate::core::models::AudioBackendKind::SpotifySoloist;
                         let is_connect =
                             active_mode == crate::core::models::AudioBackendKind::SpotifyConnect;
 
@@ -217,6 +219,51 @@ pub fn render_topbar(
                                 backend: crate::core::models::AudioBackendKind::LocalRodio,
                             });
                             commands.push(AppCommand::SaveSettings(state.settings.clone()));
+                        }
+
+                        let soloist_label = if state.soloist.logged_in {
+                            "⚡ Soloist ●"
+                        } else {
+                            "⚡ Soloist"
+                        };
+                        let soloist_btn = egui::Button::new(
+                            RichText::new(soloist_label)
+                                .size(11.0)
+                                .strong()
+                                .color(if is_soloist {
+                                    Color32::BLACK
+                                } else if state.soloist.logged_in {
+                                    theme.accent
+                                } else {
+                                    theme.text_secondary
+                                }),
+                        )
+                        .fill(if is_soloist {
+                            theme.accent
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .corner_radius(CornerRadius::same(12));
+                        if ui
+                            .add(soloist_btn)
+                            .on_hover_text(
+                                "Spotify Soloist built-in headless engine — works even after closing the official Spotify app (requires Premium + personal Soloist key)",
+                            )
+                            .clicked()
+                        {
+                            if !is_soloist {
+                                state.settings.audio_backend =
+                                    crate::core::models::AudioBackendKind::SpotifySoloist;
+                                commands.push(AppCommand::SwitchAudioBackend {
+                                    backend: crate::core::models::AudioBackendKind::SpotifySoloist,
+                                });
+                                commands.push(AppCommand::SaveSettings(state.settings.clone()));
+                            }
+                            if !state.soloist.api_key_configured
+                                || state.soloist.binary_path.is_none()
+                            {
+                                state.navigate(Route::Settings);
+                            }
                         }
 
                         let connect_btn = egui::Button::new(
