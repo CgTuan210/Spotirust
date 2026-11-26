@@ -89,6 +89,8 @@ pub fn parse_ttml(xml: &str, source: impl Into<String>) -> Result<LyricsDocument
     let mut p_romanization: Option<String> = None;
     let mut had_space_since_last_word = false;
     let mut saw_any_word_span = false;
+    let mut saw_any_line_time = false;
+    let mut declared_timing_none = false;
 
     let mut span_stack: Vec<(TextTarget, PendingSpan)> = Vec::new();
     let mut target = TextTarget::None;
@@ -99,6 +101,11 @@ pub fn parse_ttml(xml: &str, source: impl Into<String>) -> Result<LyricsDocument
                 let local = local_name_of(e.name().as_ref());
                 if local == "tt" {
                     saw_tt_root = true;
+                    if let Some(timing) = attr_value(&e, &["timing"])
+                        && timing.eq_ignore_ascii_case("none")
+                    {
+                        declared_timing_none = true;
+                    }
                 }
                 open_tags.push(local.clone());
                 match local.as_str() {
@@ -128,6 +135,9 @@ pub fn parse_ttml(xml: &str, source: impl Into<String>) -> Result<LyricsDocument
                         p_start_ms = attr_value(&e, &["begin"]).and_then(|s| parse_ttml_time(&s));
                         p_end_ms = attr_value(&e, &["end"]).and_then(|s| parse_ttml_time(&s));
                         p_dur_ms = attr_value(&e, &["dur"]).and_then(|s| parse_ttml_time(&s));
+                        if p_start_ms.is_some() || p_end_ms.is_some() {
+                            saw_any_line_time = true;
+                        }
                         p_key = attr_value(&e, &["key"]);
                         p_agent = attr_value(&e, &["agent"]);
                         p_words.clear();
@@ -259,10 +269,14 @@ pub fn parse_ttml(xml: &str, source: impl Into<String>) -> Result<LyricsDocument
                             match kind {
                                 TextTarget::WordSpan => {
                                     let raw = pending.text;
+                                    let starts_ws = raw.starts_with(char::is_whitespace);
                                     let ends_ws = raw.ends_with(char::is_whitespace);
                                     let cleaned = raw.trim().to_string();
                                     if !cleaned.is_empty() {
                                         if let Some(start) = pending.start_ms.or(p_start_ms) {
+                                            if starts_ws && let Some(prev) = p_words.last_mut() {
+                                                prev.trailing_space = true;
+                                            }
                                             // Do NOT eagerly assign `p_end_ms` when span omits `end`/`dur`:
                                             // leaving `end == start` allows post-processing to infer
                                             // end time from the next strictly greater word timestamp.
@@ -413,6 +427,21 @@ pub fn parse_ttml(xml: &str, source: impl Into<String>) -> Result<LyricsDocument
 
     if doc.lines.is_empty() {
         return Err(TtmlParseError::EmptyDocument);
+    }
+
+    let is_untimed = declared_timing_none || (!saw_any_word_span && !saw_any_line_time);
+
+    if is_untimed {
+        for line in &mut doc.lines {
+            line.start_ms = 0;
+            line.end_ms = 0;
+            for w in &mut line.words {
+                w.start_ms = 0;
+                w.end_ms = 0;
+            }
+        }
+        doc.format = LyricsFormat::PlainText;
+        return Ok(doc);
     }
 
     // Ensure lines are ordered by start_ms and backfill missing end timestamps cleanly
@@ -832,5 +861,33 @@ mod tests {
                 .and_then(|a| a.submitter_name.as_deref()),
             Some("@demo_timer")
         );
+    }
+
+    #[test]
+    fn classifies_untimed_lrc_red_ttml_as_plain_and_preserves_leading_span_spaces() {
+        let untimed_xml = r#"<tt xmlns="http://www.w3.org/ns/ttml" xmlns:lrc="http://lrc.red/lyric-ttml-internal" lrc:timing="None" xml:lang="en">
+            <body><div>
+                <p>Maybe I don't really wanna know</p>
+                <p>How your garden grows</p>
+            </div></body>
+        </tt>"#;
+        let plain = parse_ttml(untimed_xml, "BiniLyrics").expect("untimed TTML must parse");
+        assert_eq!(plain.format, LyricsFormat::PlainText);
+        assert!(!plain.format.is_time_synced());
+        assert_eq!(plain.lines.len(), 2);
+        assert_eq!(
+            plain.lines[0].plain_text(),
+            "Maybe I don't really wanna know"
+        );
+
+        let leading_space_xml = r#"<tt xmlns="http://www.w3.org/ns/ttml" xmlns:lrc="http://lrc.red/lyric-ttml-internal" lrc:timing="Word">
+            <body><div>
+                <p begin="00:01.000" end="00:03.000"><span begin="00:01.000" end="00:01.800">Hello</span><span begin="00:01.800" end="00:03.000"> world</span></p>
+            </div></body>
+        </tt>"#;
+        let timed = parse_ttml(leading_space_xml, "BiniLyrics").expect("word TTML must parse");
+        assert_eq!(timed.format, LyricsFormat::Ttml);
+        assert!(timed.has_word_timing());
+        assert_eq!(timed.lines[0].plain_text(), "Hello world");
     }
 }

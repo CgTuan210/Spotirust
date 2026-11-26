@@ -673,6 +673,15 @@ impl eframe::App for SpotirustApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let mut commands = Vec::new();
         let theme = self.theme_mgr.active().clone();
+        let desired_anim_time = if self.state.settings.reduce_motion {
+            0.0
+        } else {
+            0.14
+        };
+        if (ui.style().animation_time - desired_anim_time).abs() > 0.001 {
+            ui.ctx()
+                .global_style_mut(|s| s.animation_time = desired_anim_time);
+        }
 
         // Global keyboard media shortcuts when no text input holds keyboard focus
         if !ui.ctx().egui_wants_keyboard_input() {
@@ -726,15 +735,30 @@ impl eframe::App for SpotirustApp {
             }
         }
 
-        // 1. Fixed Bottom Player Bar
+        // 1. Floating Liquid Glass Bottom Player Dock (iOS 26 / macOS Tahoe)
+        let dock_canvas_bg = if self.state.current_route == Route::NowPlaying {
+            if theme.dark {
+                egui::Color32::from_rgb(10, 11, 14)
+            } else {
+                theme.bg_base
+            }
+        } else {
+            theme.bg_base
+        };
         Panel::bottom("spotirust_player_bar")
             .resizable(false)
-            .exact_size(84.0)
+            .exact_size(98.0)
+            .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(theme.bg_surface)
-                    .stroke(Stroke::new(1.0, theme.border))
-                    .inner_margin(Margin::symmetric(14, 6)),
+                    .fill(dock_canvas_bg)
+                    .stroke(Stroke::NONE)
+                    .inner_margin(Margin {
+                        left: 14,
+                        right: 14,
+                        top: 6,
+                        bottom: 12,
+                    }),
             )
             .show(ui, |ui| {
                 crate::ui::player::render_player_bar(
@@ -746,62 +770,131 @@ impl eframe::App for SpotirustApp {
                 );
             });
 
-        // 2. Left Navigation Sidebar (hidden in Fullscreen Now Playing for immersion)
+        // 2. Floating Rounded Glass Left Navigation Sidebar (hidden in Fullscreen Now Playing)
         if self.state.current_route != Route::NowPlaying {
             Panel::left("spotirust_sidebar")
                 .resizable(true)
-                .default_size(232.0)
-                .size_range(190.0..=300.0)
+                .default_size(262.0)
+                .size_range(220.0..=320.0)
+                .show_separator_line(false)
                 .frame(
                     Frame::new()
-                        .fill(theme.bg_surface)
-                        .stroke(Stroke::new(1.0, theme.border))
-                        .inner_margin(Margin::symmetric(12, 10)),
+                        .fill(theme.bg_base)
+                        .stroke(Stroke::NONE)
+                        .inner_margin(Margin {
+                            left: 12,
+                            right: 4,
+                            top: 12,
+                            bottom: 4,
+                        }),
                 )
                 .show(ui, |ui| {
-                    crate::ui::sidebar::render_sidebar(ui, &mut self.state, &theme, &mut commands);
+                    let sheet_rect = ui.available_rect_before_wrap();
+                    crate::ui::theme::paint_liquid_glass(
+                        ui.painter(),
+                        sheet_rect,
+                        20,
+                        theme.glass_fill(),
+                        None,
+                        &theme,
+                        false,
+                    );
+                    let inner_rect = sheet_rect.shrink2(egui::vec2(10.0, 12.0));
+                    let mut inner_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(inner_rect)
+                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                    );
+                    inner_ui.set_clip_rect(inner_rect.intersect(ui.clip_rect()));
+                    crate::ui::sidebar::render_sidebar(
+                        &mut inner_ui,
+                        &mut self.state,
+                        &theme,
+                        &mut commands,
+                    );
                 });
         }
 
-        // 3. Optional Right Utility Drawer (Compact Lyrics or Queue)
+        // 3. Optional Floating Glass Right Utility Drawer (Compact Lyrics or Queue)
         if self.state.current_route != Route::NowPlaying
             && self.state.side_drawer != SideDrawer::None
         {
             Panel::right("spotirust_right_drawer")
                 .resizable(true)
-                .default_size(320.0)
-                .size_range(260.0..=460.0)
+                .default_size(346.0)
+                .size_range(282.0..=468.0)
+                .show_separator_line(false)
                 .frame(
                     Frame::new()
-                        .fill(theme.bg_surface)
-                        .stroke(Stroke::new(1.0, theme.border))
-                        .inner_margin(Margin::same(14)),
+                        .fill(theme.bg_base)
+                        .stroke(Stroke::NONE)
+                        .inner_margin(Margin {
+                            left: 4,
+                            right: 12,
+                            top: 12,
+                            bottom: 4,
+                        }),
                 )
-                .show(ui, |ui| match self.state.side_drawer {
-                    SideDrawer::Lyrics => crate::ui::lyrics::render_lyrics_drawer(
-                        ui,
-                        &mut self.state,
+                .show(ui, |ui| {
+                    let sheet_rect = ui.available_rect_before_wrap();
+                    crate::ui::theme::paint_liquid_glass(
+                        ui.painter(),
+                        sheet_rect,
+                        20,
+                        theme.glass_fill(),
+                        None,
                         &theme,
-                        &mut self.karaoke_renderer,
-                        &mut commands,
-                    ),
-                    SideDrawer::Queue => crate::ui::player::render_queue_drawer(
-                        ui,
-                        &mut self.state,
-                        &theme,
-                        &mut commands,
-                    ),
-                    SideDrawer::None => {}
+                        false,
+                    );
+                    let inner_rect = sheet_rect.shrink(14.0);
+                    let mut inner_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(inner_rect)
+                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                    );
+                    inner_ui.set_clip_rect(inner_rect.intersect(ui.clip_rect()));
+                    match self.state.side_drawer {
+                        SideDrawer::Lyrics => crate::ui::lyrics::render_lyrics_drawer(
+                            &mut inner_ui,
+                            &mut self.state,
+                            &theme,
+                            &mut self.karaoke_renderer,
+                            &mut commands,
+                        ),
+                        SideDrawer::Queue => crate::ui::player::render_queue_drawer(
+                            &mut inner_ui,
+                            &mut self.state,
+                            &theme,
+                            &mut commands,
+                        ),
+                        SideDrawer::None => {}
+                    }
                 });
         }
 
-        // 4. Top Mini Navigation Bar
+        // 4. Floating Glass Capsules Top Navigation Bar (borderless over canvas)
+        let topbar_bg = if self.state.current_route == Route::NowPlaying {
+            if theme.dark {
+                egui::Color32::from_rgb(10, 11, 14)
+            } else {
+                theme.bg_base
+            }
+        } else {
+            theme.bg_base
+        };
         Panel::top("spotirust_topbar")
             .resizable(false)
+            .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(theme.bg_base)
-                    .inner_margin(Margin::symmetric(16, 10)),
+                    .fill(topbar_bg)
+                    .stroke(Stroke::NONE)
+                    .inner_margin(Margin {
+                        left: 22,
+                        right: 22,
+                        top: 12,
+                        bottom: 6,
+                    }),
             )
             .show(ui, |ui| {
                 crate::ui::topbar::render_topbar(ui, &mut self.state, &theme, &mut commands);
@@ -813,7 +906,7 @@ impl eframe::App for SpotirustApp {
         } else {
             Frame::new()
                 .fill(theme.bg_base)
-                .inner_margin(Margin::symmetric(20, 10))
+                .inner_margin(Margin::symmetric(28, 12))
                 .corner_radius(CornerRadius::ZERO)
         };
 
@@ -1768,7 +1861,8 @@ fn spawn_backend_coordinator(
                     let svc = lyrics_service.clone();
                     let notify = notify_ui.clone();
                     let pref = lyrics_source;
-                    let any_online = chain_config.enable_unison
+                    let any_online = chain_config.enable_binilyrics
+                        || chain_config.enable_unison
                         || chain_config.enable_amll_db
                         || chain_config.enable_musixmatch
                         || chain_config.enable_lrclib;

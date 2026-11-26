@@ -18,8 +18,11 @@ use crate::core::events::AppCommand;
 use crate::core::state::{AppState, LyricsUiState, SideDrawer};
 use crate::lyrics::model::{LyricLine, LyricsDocument};
 use crate::ui::components::artwork::{
-    ArtworkTextureCache, artwork_box, deterministic_rgb, paint_ambient_gradient,
+    ArtworkTextureCache, artwork_box, artwork_box_shadowed, deterministic_rgb,
+    paint_ambient_gradient,
 };
+use crate::ui::components::cards::empty_state;
+use crate::ui::components::icons::{Icon, icon_button, pill_button};
 use crate::ui::theme::ThemePalette;
 use egui::{
     Align, Color32, CornerRadius, FontId, Galley, Margin, Pos2, Rect, RichText, ScrollArea, Sense,
@@ -768,26 +771,28 @@ fn render_now_playing_left_column(
     artwork: &mut ArtworkTextureCache,
     commands: &mut Vec<AppCommand>,
 ) {
-    ui.add_space(16.0);
-    let art_size = (ui.available_width() - 24.0).clamp(180.0, 310.0);
+    ui.add_space(20.0);
+    let art_size = (ui.available_width() - 28.0).clamp(190.0, 320.0);
     if let Some(t) = track {
-        artwork_box(
+        artwork_box_shadowed(
             ui,
             art_size,
-            16,
+            22,
+            theme.shadow_glass(),
             t.artwork_url.as_deref(),
             &t.title,
             t.accent_rgb,
             artwork,
             commands,
         );
-        ui.add_space(16.0);
+        ui.add_space(20.0);
         ui.label(
             RichText::new(&t.title)
                 .size(22.0)
                 .strong()
                 .color(theme.text_primary),
         );
+        ui.add_space(2.0);
         ui.label(
             RichText::new(t.artist_display())
                 .size(14.5)
@@ -800,11 +805,21 @@ fn render_now_playing_left_column(
                     .color(theme.text_muted),
             );
         }
-        ui.add_space(16.0);
+        ui.add_space(18.0);
         paint_audio_visualizer_bars(ui, is_playing, time, reduce_motion, theme);
     } else {
-        artwork_box(ui, art_size, 16, None, "spotirust", None, artwork, commands);
-        ui.add_space(16.0);
+        artwork_box_shadowed(
+            ui,
+            art_size,
+            22,
+            theme.shadow_glass(),
+            None,
+            "spotirust",
+            None,
+            artwork,
+            commands,
+        );
+        ui.add_space(20.0);
         ui.label(
             RichText::new("No Track Playing")
                 .size(20.0)
@@ -829,9 +844,9 @@ fn paint_audio_visualizer_bars(
 ) {
     let bars = 16usize;
     let width = 180.0;
-    let height = 30.0;
+    let height = 28.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-    let bar_w = 5.0;
+    let bar_w = 4.5;
     let gap = (width - bars as f32 * bar_w) / (bars as f32 - 1.0);
     let fill = theme.accent.linear_multiply(0.85);
     let painter = ui.painter();
@@ -852,6 +867,61 @@ fn paint_audio_visualizer_bars(
     }
 }
 
+/// Subtle translucent pill button that blends cleanly over Now Playing ambient gradients.
+fn subtle_chip_button(ui: &mut Ui, theme: &ThemePalette, label: &str, active: bool) -> bool {
+    let font_id = FontId::proportional(11.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font_id, Color32::PLACEHOLDER);
+    let w = galley.size().x + 16.0;
+    let h = 22.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let fill = if active {
+        theme.accent_soft()
+    } else if hovered {
+        theme.hover_overlay()
+    } else if theme.dark {
+        Color32::from_white_alpha(14)
+    } else {
+        Color32::from_black_alpha(10)
+    };
+    let stroke_col = if active {
+        theme.accent.linear_multiply(0.55)
+    } else {
+        theme.hairline()
+    };
+    let text_col = if active {
+        theme.accent
+    } else if hovered {
+        theme.text_primary
+    } else {
+        theme.text_secondary
+    };
+
+    let radius = CornerRadius::same(11);
+    ui.painter().rect_filled(rect, radius, fill);
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, stroke_col),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            rect.center().x - galley.size().x * 0.5,
+            rect.center().y - galley.size().y * 0.5,
+        ),
+        galley,
+        text_col,
+    );
+    response.clicked()
+}
+
 /// Compact right-hand Lyrics side drawer.
 pub fn render_lyrics_drawer(
     ui: &mut Ui,
@@ -868,20 +938,45 @@ pub fn render_lyrics_drawer(
                 .color(theme.text_primary),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("✕").clicked() {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if icon_button(
+                ui,
+                theme,
+                Icon::Close,
+                14.0,
+                26.0,
+                false,
+                true,
+                "Close Lyrics",
+            )
+            .clicked()
+            {
                 state.side_drawer = SideDrawer::None;
             }
-            if ui
-                .small_button("⛶")
-                .on_hover_text("Open Fullscreen Now Playing")
-                .clicked()
+            if icon_button(
+                ui,
+                theme,
+                Icon::Expand,
+                14.0,
+                26.0,
+                false,
+                true,
+                "Open Fullscreen Now Playing",
+            )
+            .clicked()
             {
                 state.navigate(crate::core::models::Route::NowPlaying);
             }
         });
     });
-    ui.separator();
     ui.add_space(4.0);
+    let (sep_rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().line_segment(
+        [sep_rect.left_center(), sep_rect.right_center()],
+        Stroke::new(1.0, theme.hairline()),
+    );
+    ui.add_space(8.0);
     render_lyrics_body(ui, state, theme, karaoke, commands, true);
 }
 
@@ -897,11 +992,13 @@ fn render_lyrics_body(
     let clock_stale = state.playback.position.is_stale();
     let (doc, doc_revision) = match &state.lyrics {
         LyricsUiState::Idle => {
-            ui.add_space(24.0);
-            ui.label(
-                RichText::new("Play a track to display synchronized word-by-word lyrics.")
-                    .size(14.0)
-                    .color(theme.text_secondary),
+            ui.add_space(16.0);
+            empty_state(
+                ui,
+                theme,
+                Icon::Lyrics,
+                "No lyrics yet",
+                "Play a track to follow synchronized word-by-word karaoke lyrics.",
             );
             return;
         }
@@ -911,7 +1008,7 @@ fn render_lyrics_body(
                 ui.spinner();
                 ui.label(
                     RichText::new("Loading synchronized lyrics…")
-                        .size(14.0)
+                        .size(13.5)
                         .color(theme.text_secondary),
                 );
             });
@@ -924,7 +1021,7 @@ fn render_lyrics_body(
         } => {
             let provider_label = provider_name.clone();
             let cand_list = candidates.clone();
-            ui.add_space(12.0);
+            ui.add_space(8.0);
             ui.label(
                 RichText::new("Select the exact track version")
                     .size(18.0)
@@ -933,12 +1030,12 @@ fn render_lyrics_body(
             );
             ui.label(
                 RichText::new(format!(
-                    "Multiple closely-matched versions were found on {provider_label}. Choose one to confirm lyrics synchronization:"
+                    "Multiple closely-matched versions were found on {provider_label}. Choose one to confirm sync:"
                 ))
-                .size(12.0)
+                .size(12.5)
                 .color(theme.text_secondary),
             );
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             if let Some(track) = state.playback.current_track.clone() {
                 ScrollArea::vertical()
                     .id_salt("lyrics_ambiguous_picker")
@@ -947,9 +1044,9 @@ fn render_lyrics_body(
                         for cand in &cand_list {
                             egui::Frame::new()
                                 .fill(theme.bg_elevated)
-                                .corner_radius(CornerRadius::same(8))
-                                .stroke(Stroke::new(1.0, theme.border))
-                                .inner_margin(Margin::same(10))
+                                .corner_radius(CornerRadius::same(10))
+                                .stroke(Stroke::new(1.0, theme.hairline()))
+                                .inner_margin(Margin::same(12))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.vertical(|ui| {
@@ -981,7 +1078,9 @@ fn render_lyrics_body(
                                         ui.with_layout(
                                             egui::Layout::right_to_left(Align::Center),
                                             |ui| {
-                                                if ui.button("Use").clicked() {
+                                                if pill_button(ui, theme, None, "Use", true, true)
+                                                    .clicked()
+                                                {
                                                     commands.push(
                                                         AppCommand::SelectLyricsCandidate {
                                                             track: track.clone(),
@@ -1003,22 +1102,27 @@ fn render_lyrics_body(
         }
         LyricsUiState::Unavailable { reason, .. } => {
             let reason_text = reason.clone();
-            ui.add_space(16.0);
-            ui.label(
-                RichText::new("Lyrics not available")
-                    .size(18.0)
-                    .strong()
-                    .color(theme.text_primary),
-            );
-            ui.label(
-                RichText::new(reason_text)
-                    .size(12.5)
-                    .color(theme.text_secondary),
+            ui.add_space(12.0);
+            empty_state(
+                ui,
+                theme,
+                Icon::Lyrics,
+                "Lyrics not available",
+                &reason_text,
             );
             ui.add_space(10.0);
             if let Some(track) = state.playback.current_track.clone() {
                 ui.horizontal(|ui| {
-                    if ui.button("↻ Refresh Lyrics").clicked() {
+                    if pill_button(
+                        ui,
+                        theme,
+                        Some(Icon::Refresh),
+                        "Refresh Lyrics",
+                        false,
+                        true,
+                    )
+                    .clicked()
+                    {
                         commands.push(AppCommand::FetchLyrics {
                             track: track.clone(),
                             force_refresh: true,
@@ -1065,79 +1169,105 @@ fn render_lyrics_body(
         offset_label_fallback.as_str()
     };
 
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new(timing_pill)
-                .size(11.0)
-                .strong()
-                .color(timing_color),
-        );
-        ui.label(RichText::new("·").size(11.0).color(theme.text_muted));
-        ui.label(
-            RichText::new(doc.source.as_str())
-                .size(11.0)
-                .color(theme.text_secondary),
-        );
-        if clock_stale {
-            ui.label(
-                RichText::new("· Sync Stale")
-                    .size(11.0)
-                    .strong()
-                    .color(theme.warning),
-            );
-        }
-        ui.separator();
+    egui::Frame::new()
+        .fill(if theme.dark {
+            Color32::from_rgba_unmultiplied(20, 23, 30, 155)
+        } else {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 195)
+        })
+        .corner_radius(CornerRadius::same(16))
+        .stroke(Stroke::new(1.0, theme.glass_border()))
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                egui::Frame::new()
+                    .fill(if doc.has_word_timing() {
+                        theme.accent_soft()
+                    } else {
+                        theme.bg_elevated
+                    })
+                    .corner_radius(CornerRadius::same(11))
+                    .inner_margin(Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(timing_pill)
+                                .size(10.5)
+                                .strong()
+                                .color(timing_color),
+                        );
+                    });
+                ui.label(
+                    RichText::new(doc.source.as_str())
+                        .size(11.5)
+                        .color(theme.text_secondary),
+                );
+                if clock_stale {
+                    ui.label(
+                        RichText::new("· Sync Stale")
+                            .size(11.0)
+                            .strong()
+                            .color(theme.warning),
+                    );
+                }
 
-        if ui.small_button("-50ms").clicked() {
-            commands.push(AppCommand::SetLyricsOffset {
-                offset_ms: doc.offset_ms - 50,
+                if subtle_chip_button(ui, theme, "-50ms", false) {
+                    commands.push(AppCommand::SetLyricsOffset {
+                        offset_ms: doc.offset_ms - 50,
+                    });
+                }
+                ui.label(
+                    RichText::new(offset_label)
+                        .font(FontId::monospace(11.0))
+                        .color(theme.text_muted),
+                );
+                if subtle_chip_button(ui, theme, "+50ms", false) {
+                    commands.push(AppCommand::SetLyricsOffset {
+                        offset_ms: doc.offset_ms + 50,
+                    });
+                }
+
+                if subtle_chip_button(
+                    ui,
+                    theme,
+                    "Translations",
+                    state.settings.show_lyric_translations,
+                ) {
+                    state.settings.show_lyric_translations =
+                        !state.settings.show_lyric_translations;
+                    commands.push(AppCommand::SaveSettings(state.settings.clone()));
+                }
+
+                if has_active_track {
+                    if icon_button(
+                        ui,
+                        theme,
+                        Icon::Refresh,
+                        13.0,
+                        24.0,
+                        false,
+                        true,
+                        "Force refresh lyrics (bypass cache)",
+                    )
+                    .clicked()
+                        && let Some(track) = state.playback.current_track.clone()
+                    {
+                        commands.push(AppCommand::FetchLyrics {
+                            track,
+                            force_refresh: true,
+                        });
+                    }
+                    if subtle_chip_button(ui, theme, "Import", state.show_lyrics_import) {
+                        state.show_lyrics_import = !state.show_lyrics_import;
+                    }
+                }
+
+                if !state.lyrics_auto_scroll && subtle_chip_button(ui, theme, "Sync Scroll", true) {
+                    state.lyrics_auto_scroll = true;
+                    state.last_scrolled_line_idx = None;
+                }
             });
-        }
-        ui.label(
-            RichText::new(offset_label)
-                .size(11.0)
-                .color(theme.text_muted),
-        );
-        if ui.small_button("+50ms").clicked() {
-            commands.push(AppCommand::SetLyricsOffset {
-                offset_ms: doc.offset_ms + 50,
-            });
-        }
-
-        if ui
-            .selectable_label(state.settings.show_lyric_translations, "Translations")
-            .clicked()
-        {
-            state.settings.show_lyric_translations = !state.settings.show_lyric_translations;
-            commands.push(AppCommand::SaveSettings(state.settings.clone()));
-        }
-
-        if has_active_track {
-            if ui
-                .small_button("↻")
-                .on_hover_text("Force refresh lyrics (bypass cache)")
-                .clicked()
-                && let Some(track) = state.playback.current_track.clone()
-            {
-                commands.push(AppCommand::FetchLyrics {
-                    track,
-                    force_refresh: true,
-                });
-            }
-            if ui
-                .selectable_label(state.show_lyrics_import, "Import")
-                .on_hover_text("Import local .ttml or .lrc override for this track")
-                .clicked()
-            {
-                state.show_lyrics_import = !state.show_lyrics_import;
-            }
-        }
-
-        if !state.lyrics_auto_scroll && ui.small_button("◎ Sync Scroll").clicked() {
-            state.lyrics_auto_scroll = true;
-            state.last_scrolled_line_idx = None;
-        }
-    });
+        });
 
     if state.show_lyrics_import
         && let Some(track) = state.playback.current_track.clone()
@@ -1146,15 +1276,16 @@ fn render_lyrics_body(
         render_local_import_box(ui, state, &track, theme, commands);
     }
 
-    ui.add_space(8.0);
+    ui.add_space(10.0);
 
     if doc.instrumental {
-        ui.add_space(32.0);
-        ui.label(
-            RichText::new("♪  Instrumental Track")
-                .size(22.0)
-                .strong()
-                .color(theme.text_secondary),
+        ui.add_space(24.0);
+        empty_state(
+            ui,
+            theme,
+            Icon::MusicNote,
+            "Instrumental Track",
+            "Sit back and enjoy the music.",
         );
         return;
     }
@@ -1442,11 +1573,18 @@ fn render_local_import_box(
             .size(12.0)
             .color(theme.text_secondary),
     );
+    ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
-        if ui
-            .button("📁 Browse .ttml / .lrc…")
-            .on_hover_text("Open native file picker to import a local TTML or LRC file")
-            .clicked()
+        if pill_button(
+            ui,
+            theme,
+            Some(Icon::Folder),
+            "Browse .ttml / .lrc",
+            false,
+            true,
+        )
+        .on_hover_text("Open native file picker to import a local TTML or LRC file")
+        .clicked()
         {
             commands.push(AppCommand::PickImportLyricsFile {
                 track: track.clone(),
@@ -1456,9 +1594,9 @@ fn render_local_import_box(
             egui::TextEdit::singleline(&mut state.import_lyrics_path)
                 .hint_text("/path/to/song.ttml")
                 .desired_width(220.0)
-                .margin(Margin::symmetric(8, 5)),
+                .margin(Margin::symmetric(10, 6)),
         );
-        if ui.button("Import Path").clicked() {
+        if pill_button(ui, theme, None, "Import Path", false, true).clicked() {
             let p = PathBuf::from(state.import_lyrics_path.trim());
             if !p.as_os_str().is_empty() {
                 commands.push(AppCommand::ImportLyricsFile {

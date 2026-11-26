@@ -2,6 +2,7 @@
 //! priority, strict anti-remix/live/remastered track matching, and SQLite caching.
 //!
 //! Supported real providers & formats:
+//! - `BiniLyricsProvider`: word-level & line-synced TTML lookup (`lyrics-api.binimum.org` / `lrc.red`)
 //! - `UnisonProvider`: open-source MIT-permitted word-level TTML / LRC / plain API (`unison.betterlyrics.org`)
 //! - `AmllTtmlDbProvider`: CC0-1.0 community hand-timed word-level TTML DB (`amll-dev/amll-ttml-db`)
 //! - `MusixmatchProvider`: official Musixmatch Developer API (`RichSync` word-level, Subtitle LRC, Plain)
@@ -11,6 +12,7 @@
 
 pub mod amll_db;
 pub mod apple_music;
+pub mod binilyrics;
 pub mod cache;
 pub mod lrc;
 pub mod lrclib;

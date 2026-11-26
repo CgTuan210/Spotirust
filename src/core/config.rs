@@ -28,10 +28,11 @@ pub const COMPILE_TIME_REDIRECT_PORT: Option<&str> = option_env!("SPOTIRUST_REDI
 /// Default registered loopback redirect URI template.
 pub const DEFAULT_SPOTIFY_REDIRECT_URI: &str = "http://127.0.0.1/callback";
 
-/// Identifier for each compliant online lyrics provider that can be ordered & toggled in Automatic mode.
+/// Identifier for each online lyrics provider that can be ordered & toggled in Automatic mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnlineLyricsProviderId {
+    BiniLyrics,
     Unison,
     AmllTtmlDb,
     Musixmatch,
@@ -41,6 +42,7 @@ pub enum OnlineLyricsProviderId {
 impl OnlineLyricsProviderId {
     pub fn default_order() -> Vec<Self> {
         vec![
+            Self::BiniLyrics,
             Self::Unison,
             Self::AmllTtmlDb,
             Self::Musixmatch,
@@ -50,6 +52,7 @@ impl OnlineLyricsProviderId {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::BiniLyrics => "BiniLyrics (Word TTML · lyrics-api.binimum.org)",
             Self::Unison => "Unison (Word TTML · Open-Source MIT)",
             Self::AmllTtmlDb => "AMLL TTML DB (Word TTML · CC0-1.0 · Spotify ID)",
             Self::Musixmatch => "Musixmatch Official API (RichSync/Subtitle/Plain · API Key)",
@@ -59,6 +62,7 @@ impl OnlineLyricsProviderId {
 
     pub fn short_label(self) -> &'static str {
         match self {
+            Self::BiniLyrics => "BiniLyrics",
             Self::Unison => "Unison",
             Self::AmllTtmlDb => "AMLL TTML DB",
             Self::Musixmatch => "Musixmatch",
@@ -71,6 +75,7 @@ impl OnlineLyricsProviderId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LyricsProviderChainConfig {
     pub order: Vec<OnlineLyricsProviderId>,
+    pub enable_binilyrics: bool,
     pub enable_unison: bool,
     pub enable_amll_db: bool,
     pub enable_musixmatch: bool,
@@ -81,6 +86,7 @@ impl Default for LyricsProviderChainConfig {
     fn default() -> Self {
         Self {
             order: OnlineLyricsProviderId::default_order(),
+            enable_binilyrics: true,
             enable_unison: true,
             enable_amll_db: true,
             enable_musixmatch: true,
@@ -92,6 +98,7 @@ impl Default for LyricsProviderChainConfig {
 impl LyricsProviderChainConfig {
     pub fn is_enabled(&self, id: OnlineLyricsProviderId) -> bool {
         match id {
+            OnlineLyricsProviderId::BiniLyrics => self.enable_binilyrics,
             OnlineLyricsProviderId::Unison => self.enable_unison,
             OnlineLyricsProviderId::AmllTtmlDb => self.enable_amll_db,
             OnlineLyricsProviderId::Musixmatch => self.enable_musixmatch,
@@ -101,7 +108,7 @@ impl LyricsProviderChainConfig {
 
     /// Return deduplicated configured provider order with any missing providers appended.
     pub fn normalized_order(&self) -> Vec<OnlineLyricsProviderId> {
-        let mut out = Vec::with_capacity(4);
+        let mut out = Vec::with_capacity(5);
         for &id in &self.order {
             if !out.contains(&id) {
                 out.push(id);
@@ -118,13 +125,15 @@ impl LyricsProviderChainConfig {
 
 /// User-selected lyrics source strategy shown in Settings.
 ///
-/// Spotirust NEVER mislabels LRCLIB, Unison, AMLL, or local files as "Apple Music" or "BiniLyrics".
+/// Spotirust always labels each provider honestly and NEVER mislabels one source as another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LyricsSourcePreference {
-    /// Automatic compliant chain prioritizing Word-level -> Line-level -> Plain across enabled providers.
+    /// Automatic chain prioritizing Word-level -> Line-level -> Plain across enabled providers.
     #[default]
     Automatic,
+    /// BiniLyrics TTML word-timing API only (`lyrics-api.binimum.org` / `lrc.red`).
+    BiniLyrics,
     /// Unison open-source word-level TTML API only (`unison.betterlyrics.org`).
     Unison,
     /// AMLL TTML DB (CC0-1.0) hand-timed word-level TTML by Spotify ID only.
@@ -143,7 +152,10 @@ pub enum LyricsSourcePreference {
 impl LyricsSourcePreference {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Automatic => "Automatic (Local -> Unison -> AMLL -> Musixmatch -> LRCLIB)",
+            Self::Automatic => {
+                "Automatic (Local -> BiniLyrics -> Unison -> AMLL -> Musixmatch -> LRCLIB)"
+            }
+            Self::BiniLyrics => "BiniLyrics Only (Word-Synced TTML · lyrics-api.binimum.org)",
             Self::Unison => "Unison Only (Word-Synced TTML · unison.betterlyrics.org)",
             Self::AmllTtmlDb => "AMLL TTML DB Only (Word-Synced TTML · CC0-1.0)",
             Self::Musixmatch => "Musixmatch Official API Only (Requires Developer API Key)",
@@ -156,6 +168,7 @@ impl LyricsSourcePreference {
     pub fn short_label(self) -> &'static str {
         match self {
             Self::Automatic => "Automatic",
+            Self::BiniLyrics => "BiniLyrics",
             Self::Unison => "Unison",
             Self::AmllTtmlDb => "AMLL DB",
             Self::Musixmatch => "Musixmatch",
@@ -190,6 +203,8 @@ pub struct UserSettings {
     pub lyrics_provider_order: Vec<OnlineLyricsProviderId>,
     pub prefer_ttml_lyrics: bool,
     #[serde(default = "default_true")]
+    pub enable_binilyrics_online: bool,
+    #[serde(default = "default_true")]
     pub enable_unison_online: bool,
     #[serde(default = "default_true")]
     pub enable_amll_db_online: bool,
@@ -217,6 +232,7 @@ impl UserSettings {
     pub fn lyrics_chain_config(&self) -> LyricsProviderChainConfig {
         LyricsProviderChainConfig {
             order: self.lyrics_provider_order.clone(),
+            enable_binilyrics: self.enable_binilyrics_online,
             enable_unison: self.enable_unison_online,
             enable_amll_db: self.enable_amll_db_online,
             enable_musixmatch: self.enable_musixmatch_online,
@@ -233,6 +249,7 @@ impl Default for UserSettings {
             lyrics_source: LyricsSourcePreference::Automatic,
             lyrics_provider_order: OnlineLyricsProviderId::default_order(),
             prefer_ttml_lyrics: true,
+            enable_binilyrics_online: true,
             enable_unison_online: true,
             enable_amll_db_online: true,
             enable_musixmatch_online: true,

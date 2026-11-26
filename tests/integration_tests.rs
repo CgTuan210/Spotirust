@@ -3077,7 +3077,14 @@ async fn lyrics_service_ordered_fallback_timeout_404_429_503_word_priority_and_z
         (addr, hits, handle)
     }
 
-    // --- Scenario A: Unison returns Word TTML -> ZERO calls to AMLL, Musixmatch, LRCLIB ---
+    // --- Scenario A: BiniLyrics returns 404 -> Unison returns Word TTML -> ZERO calls to AMLL, Musixmatch, LRCLIB ---
+    let (b_addr, b_hits, b_srv) = spawn_mock(|_| {
+        (
+            0,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        )
+    })
+    .await;
     let (u_addr, u_hits, u_srv) = spawn_mock(|_| {
         let body = r#"{"success":true,"data":{"id":1,"videoId":"v1","song":"FastHit","artist":"Echo","duration":180,"format":"ttml","syncType":"richsync","lyrics":"<tt xmlns=\"http://www.w3.org/ns/ttml\" itunes:timing=\"Word\" xmlns:itunes=\"http://music.apple.com/lyric-ttml-internal\"><body><div><p begin=\"00:01.000\" end=\"00:03.000\"><span begin=\"00:01.000\" end=\"00:02.000\">Word</span> <span begin=\"00:02.000\" end=\"00:03.000\">hit</span></p></div></body></tt>"}}"#;
         (
@@ -3115,6 +3122,10 @@ async fn lyrics_service_ordered_fallback_timeout_404_429_503_word_priority_and_z
 
     let db = Database::open_in_memory().unwrap();
     let svc_fast = LyricsService::new(LyricsCache::new(db), vec![])
+        .with_binilyrics(
+            spotirust::lyrics::binilyrics::BiniLyricsProvider::new()
+                .with_base_url(format!("http://{b_addr}")),
+        )
         .with_unison(UnisonProvider::new().with_base_url(format!("http://{u_addr}")))
         .with_amll_db(AmllTtmlDbProvider::new().with_base_url(format!("http://{a_addr}")))
         .with_musixmatch(
@@ -3145,6 +3156,7 @@ async fn lyrics_service_ordered_fallback_timeout_404_429_503_word_priority_and_z
         other => panic!("expected fast Unison hit, got {other:?}"),
     };
     assert!(doc_a.has_word_timing());
+    assert!(b_hits.load(Ordering::SeqCst) >= 1);
     assert_eq!(u_hits.load(Ordering::SeqCst), 1);
     assert_eq!(
         a_hits.load(Ordering::SeqCst),
@@ -3168,12 +3180,20 @@ async fn lyrics_service_ordered_fallback_timeout_404_429_503_word_priority_and_z
         .await;
     assert_eq!(u_hits.load(Ordering::SeqCst), 1);
 
+    b_srv.abort();
     u_srv.abort();
     a_srv.abort();
     m_srv.abort();
     l_srv.abort();
 
-    // --- Scenario B: Unison Timeout (500ms vs 150ms) -> AMLL 404 -> Musixmatch 402 -> LRCLIB Word Lyricsfile ---
+    // --- Scenario B: BiniLyrics 404 -> Unison Timeout (500ms vs 150ms) -> AMLL 404 -> Musixmatch 402 -> LRCLIB Word Lyricsfile ---
+    let (b2_addr, _, b2_srv) = spawn_mock(|_| {
+        (
+            0,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        )
+    })
+    .await;
     let (u2_addr, _, u2_srv) = spawn_mock(|_| {
         (
             500,
@@ -3223,6 +3243,10 @@ async fn lyrics_service_ordered_fallback_timeout_404_429_503_word_priority_and_z
 
     let db2 = Database::open_in_memory().unwrap();
     let svc_fallback = LyricsService::new(LyricsCache::new(db2), vec![])
+        .with_binilyrics(
+            spotirust::lyrics::binilyrics::BiniLyricsProvider::new()
+                .with_base_url(format!("http://{b2_addr}")),
+        )
         .with_unison(
             UnisonProvider::with_timeout(Duration::from_millis(150))
                 .with_base_url(format!("http://{u2_addr}")),
@@ -3258,6 +3282,7 @@ async fn lyrics_service_ordered_fallback_timeout_404_429_503_word_priority_and_z
     assert_eq!(doc_b.format, LyricsFormat::LyricsfileWord);
     assert_eq!(doc_b.lines[0].plain_text(), "Fallback works");
 
+    b2_srv.abort();
     u2_srv.abort();
     a2_srv.abort();
     m2_srv.abort();
@@ -3307,6 +3332,7 @@ async fn lyrics_service_ordered_fallback_timeout_404_429_503_word_priority_and_z
                 OnlineLyricsProviderId::Unison,
                 OnlineLyricsProviderId::Lrclib,
             ],
+            enable_binilyrics: false,
             enable_unison: true,
             enable_amll_db: false,
             enable_musixmatch: false,
@@ -3341,6 +3367,162 @@ async fn lyrics_service_ordered_fallback_timeout_404_429_503_word_priority_and_z
 
     u3_srv.abort();
     l3_srv.abort();
+}
+
+#[tokio::test]
+async fn binilyrics_provider_isrc_search_ttml_word_sync_ssrf_guard_and_rate_limit() {
+    use spotirust::core::config::LyricsSourcePreference;
+    use spotirust::lyrics::binilyrics::BiniLyricsProvider;
+    use spotirust::lyrics::cache::LyricsCache;
+    use spotirust::lyrics::model::LyricsFormat;
+    use spotirust::lyrics::provider::{
+        LyricsError, LyricsProvider, LyricsResolution, LyricsService, TrackMetadata,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let base_srv = base.clone();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_srv = Arc::clone(&hits);
+
+    let srv = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let base_inner = base_srv.clone();
+            let hc = Arc::clone(&hits_srv);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let Ok(n) = sock.read(&mut buf).await else {
+                    return;
+                };
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let target = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                hc.fetch_add(1, Ordering::SeqCst);
+
+                let (status, content_type, body) = if target.contains("isrc=GBAAW9400140") {
+                    let json = format!(
+                        r#"{{"results":[{{"id":"GBAAW9400140","track_name":"Live Forever","artist_name":"Oasis","album_name":"Definitely Maybe","duration":276,"isrc":"GBAAW9400140","lyricsUrl":"{base_inner}/s/GBAAW9400140.ttml","timing_type":"word"}},{{"id":"EVIL","track_name":"Live Forever","artist_name":"Oasis","album_name":"Definitely Maybe","duration":276,"isrc":"GBAAW9400140","lyricsUrl":"https://evil.example/ssrf.ttml","timing_type":"word"}}],"source":"HIT-LRC-RED"}}"#
+                    );
+                    ("200 OK", "application/json", json)
+                } else if target == "/s/GBAAW9400140.ttml" {
+                    let ttml = r#"<tt xmlns="http://www.w3.org/ns/ttml" xmlns:lrc="http://lrc.red/lyric-ttml-internal" lrc:timing="Word" xml:lang="en"><body><div><p begin="00:01.000" end="00:03.500"><span begin="00:01.000" end="00:01.700">May</span><span begin="00:01.700" end="00:02.200">be</span> <span begin="00:02.200" end="00:02.700">I</span> <span begin="00:02.700" end="00:03.500">fly</span></p></div></body></tt>"#;
+                    ("200 OK", "application/ttml+xml", ttml.to_string())
+                } else if target.contains("track=RateLimited") {
+                    (
+                        "429 Too Many Requests\r\nRetry-After: 42",
+                        "application/json",
+                        r#"{"error":"rate limited"}"#.to_string(),
+                    )
+                } else {
+                    ("404 Not Found", "application/json", String::new())
+                };
+
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let provider = BiniLyricsProvider::new().with_base_url(&base);
+
+    // 1. Search filters out SSRF evil.example URL and returns only the allowlisted TTML candidate
+    let meta = TrackMetadata {
+        track_id: "bini_track_1".into(),
+        uri: "spotify:track:bini_track_1".into(),
+        title: "Live Forever".into(),
+        artist: "Oasis".into(),
+        artists: vec!["Oasis".into()],
+        album: "Definitely Maybe".into(),
+        duration_ms: 276_000,
+        isrc: Some("GBAAW9400140".into()),
+        explicit: false,
+        local_path: None,
+    };
+    let candidates = provider.search(&meta).await.expect("search should succeed");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "evil.example SSRF candidate must be rejected"
+    );
+    assert!(candidates[0].has_word_sync);
+
+    // 2. Full LyricsService resolution via LyricsSourcePreference::BiniLyrics parses word TTML & caches
+    let db = Database::open_in_memory().unwrap();
+    let svc = LyricsService::new(LyricsCache::new(db), vec![]).with_binilyrics(provider.clone());
+    let track = Track {
+        id: "bini_track_1".into(),
+        uri: "spotify:track:bini_track_1".into(),
+        title: "Live Forever".into(),
+        artists: vec!["Oasis".into()],
+        album_id: None,
+        album_name: "Definitely Maybe".into(),
+        duration_ms: 276_000,
+        isrc: Some("GBAAW9400140".into()),
+        artwork_url: None,
+        explicit: false,
+        liked: false,
+        local_path: None,
+        accent_rgb: None,
+    };
+    let doc = match svc
+        .resolve_with_preference(&track, LyricsSourcePreference::BiniLyrics, true, true)
+        .await
+    {
+        LyricsResolution::Found(d) => d,
+        other => panic!("expected BiniLyrics word TTML hit, got {other:?}"),
+    };
+    assert_eq!(doc.format, LyricsFormat::Ttml);
+    assert!(doc.has_word_timing());
+    assert_eq!(doc.source, "BiniLyrics");
+    assert_eq!(doc.lines[0].words.len(), 4);
+    assert_eq!(doc.lines[0].plain_text(), "Maybe I fly");
+
+    let hits_after_first = hits.load(Ordering::SeqCst);
+    let cached_doc = match svc
+        .resolve_with_preference(&track, LyricsSourcePreference::BiniLyrics, true, false)
+        .await
+    {
+        LyricsResolution::Found(d) => d,
+        other => panic!("expected cached BiniLyrics doc, got {other:?}"),
+    };
+    assert_eq!(cached_doc.lines[0].plain_text(), "Maybe I fly");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        hits_after_first,
+        "cached BiniLyrics lookup must issue zero network requests"
+    );
+
+    // 3. 429 Too Many Requests surfaces LyricsError::RateLimited with Retry-After
+    let rl_meta = TrackMetadata {
+        track_id: "rl".into(),
+        uri: "spotify:track:rl".into(),
+        title: "RateLimited".into(),
+        artist: "Oasis".into(),
+        artists: vec!["Oasis".into()],
+        album: String::new(),
+        duration_ms: 180_000,
+        isrc: None,
+        explicit: false,
+        local_path: None,
+    };
+    match provider.search(&rl_meta).await {
+        Err(LyricsError::RateLimited { retry_after_secs }) => assert_eq!(retry_after_secs, 42),
+        other => panic!("expected RateLimited(42), got {other:?}"),
+    }
+
+    srv.abort();
 }
 
 // =============================================================================

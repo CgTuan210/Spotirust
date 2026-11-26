@@ -4,14 +4,14 @@
 //! Implemented real providers:
 //! 1. `BundledShowcaseLyricsProvider`: royalty-free offline Soundcheck TTML & Enhanced LRC
 //! 2. `LocalFileLyricsProvider`: user-supplied `.ttml`, `.lyricsfile`, and `.lrc` files
-//! 3. `UnisonProvider`: open-source MIT-permitted word-level TTML API (`unison.betterlyrics.org`)
-//! 4. `AmllTtmlDbProvider`: CC0-1.0 community hand-timed word-level TTML DB (`amll-dev/amll-ttml-db`)
-//! 5. `MusixmatchProvider`: official Musixmatch Developer API (`RichSync` word, Subtitle LRC, Plain)
-//! 6. `LrclibProvider`: public LRCLIB REST API with CC0 `Lyricsfile` v1.0 word-sync + LRC + Plain
-//! 7. `AppleMusicLyricsProvider`: honest upstream-blocked status (zero unauthorized endpoints)
+//! 3. `BiniLyricsProvider`: word-level & line-synced TTML lookup (`lyrics-api.binimum.org` / `lrc.red`)
+//! 4. `UnisonProvider`: open-source MIT-permitted word-level TTML API (`unison.betterlyrics.org`)
+//! 5. `AmllTtmlDbProvider`: CC0-1.0 community hand-timed word-level TTML DB (`amll-dev/amll-ttml-db`)
+//! 6. `MusixmatchProvider`: official Musixmatch Developer API (`RichSync` word, Subtitle LRC, Plain)
+//! 7. `LrclibProvider`: public LRCLIB REST API with CC0 `Lyricsfile` v1.0 word-sync + LRC + Plain
+//! 8. `AppleMusicLyricsProvider`: honest upstream-blocked status (zero unauthorized endpoints)
 //!
-//! Strictly excludes unauthorized Apple Music / BiniLyrics scraping proxies and NEVER mislabels
-//! one source as another or fabricates fake timestamps for plain lyrics.
+//! Always labels every lyrics source honestly and NEVER fabricates fake timestamps for plain lyrics.
 
 use crate::core::config::{
     LyricsProviderChainConfig, LyricsSourcePreference, OnlineLyricsProviderId,
@@ -19,6 +19,7 @@ use crate::core::config::{
 use crate::core::models::Track;
 use crate::lyrics::amll_db::AmllTtmlDbProvider;
 use crate::lyrics::apple_music::AppleMusicLyricsProvider;
+pub use crate::lyrics::binilyrics::BiniLyricsProvider;
 use crate::lyrics::cache::LyricsCache;
 use crate::lyrics::lrc::{parse_lrc, parse_plain_lyrics};
 pub use crate::lyrics::lrclib::LrclibProvider;
@@ -53,6 +54,7 @@ pub(crate) fn parse_retry_after(resp: &reqwest::Response, default_secs: u64) -> 
 pub enum LyricsSourceKind {
     BundledSample,
     LocalFiles,
+    BiniLyrics,
     Unison,
     AmllTtmlDb,
     Musixmatch,
@@ -66,6 +68,7 @@ impl LyricsSourceKind {
         match self {
             Self::BundledSample => "Bundled Sample",
             Self::LocalFiles => "Local File",
+            Self::BiniLyrics => "BiniLyrics",
             Self::Unison => "Unison",
             Self::AmllTtmlDb => "AMLL TTML DB",
             Self::Musixmatch => "Musixmatch",
@@ -574,6 +577,7 @@ impl LyricsProvider for LocalFileLyricsProvider {
 pub struct LyricsService {
     cache: LyricsCache,
     local_dirs: Vec<PathBuf>,
+    binilyrics: BiniLyricsProvider,
     unison: UnisonProvider,
     amll_db: AmllTtmlDbProvider,
     musixmatch: MusixmatchProvider,
@@ -588,6 +592,7 @@ impl LyricsService {
         Self {
             cache,
             local_dirs,
+            binilyrics: BiniLyricsProvider::new(),
             unison: UnisonProvider::new(),
             amll_db: AmllTtmlDbProvider::new(),
             musixmatch: MusixmatchProvider::default(),
@@ -596,6 +601,11 @@ impl LyricsService {
             chain_config: LyricsProviderChainConfig::default(),
             extra_providers: Vec::new(),
         }
+    }
+
+    pub fn with_binilyrics(mut self, binilyrics: BiniLyricsProvider) -> Self {
+        self.binilyrics = binilyrics;
+        self
     }
 
     pub fn with_unison(mut self, unison: UnisonProvider) -> Self {
@@ -654,6 +664,7 @@ impl LyricsService {
 
     fn online_provider_for(&self, id: OnlineLyricsProviderId) -> Arc<dyn LyricsProvider> {
         match id {
+            OnlineLyricsProviderId::BiniLyrics => Arc::new(self.binilyrics.clone()),
             OnlineLyricsProviderId::Unison => Arc::new(self.unison.clone()),
             OnlineLyricsProviderId::AmllTtmlDb => Arc::new(self.amll_db.clone()),
             OnlineLyricsProviderId::Musixmatch => Arc::new(self.musixmatch.clone()),
@@ -736,6 +747,14 @@ impl LyricsService {
                     Arc::new(BundledShowcaseLyricsProvider),
                     Arc::new(LocalFileLyricsProvider::new(self.local_dirs.clone())),
                 ]
+            }
+            LyricsSourcePreference::BiniLyrics => {
+                let mut list: Vec<Arc<dyn LyricsProvider>> =
+                    vec![Arc::new(BundledShowcaseLyricsProvider)];
+                if !is_bundled_sample {
+                    list.push(Arc::new(self.binilyrics.clone()));
+                }
+                list
             }
             LyricsSourcePreference::Unison => {
                 let mut list: Vec<Arc<dyn LyricsProvider>> =
@@ -1006,6 +1025,9 @@ impl LyricsService {
                 "No local .ttml, .lyricsfile, or .lrc file found for this track. Click Import to attach one."
                     .to_string()
             }
+            LyricsSourcePreference::BiniLyrics => {
+                "No matching lyrics found on BiniLyrics (lyrics-api.binimum.org).".to_string()
+            }
             LyricsSourcePreference::Unison => {
                 "No matching lyrics found on Unison (unison.betterlyrics.org).".to_string()
             }
@@ -1038,6 +1060,11 @@ impl LyricsService {
                 .await
                 .map_err(|e| e.to_string())?,
             LyricsSourceKind::LocalFiles => LocalFileLyricsProvider::new(self.local_dirs.clone())
+                .fetch(candidate)
+                .await
+                .map_err(|e| e.to_string())?,
+            LyricsSourceKind::BiniLyrics => self
+                .binilyrics
                 .fetch(candidate)
                 .await
                 .map_err(|e| e.to_string())?,
@@ -1138,6 +1165,9 @@ fn cached_source_matches_preference(source: &str, pref: LyricsSourcePreference) 
         LyricsSourcePreference::AppleMusic => false,
         LyricsSourcePreference::LocalOnly => {
             lower.starts_with("local file") || lower.starts_with("bundled sample")
+        }
+        LyricsSourcePreference::BiniLyrics => {
+            lower.starts_with("binilyrics") || lower.starts_with("bundled sample")
         }
         LyricsSourcePreference::Unison => {
             lower.starts_with("unison") || lower.starts_with("bundled sample")

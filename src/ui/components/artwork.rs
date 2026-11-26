@@ -174,8 +174,8 @@ impl ArtworkTextureCache {
     }
 }
 
-/// Paint album artwork inside `rect` with smooth rounded corners, falling back to an
-/// original procedural gradient cover when offline or loading.
+/// Paint album artwork inside `rect` with true GPU-clipped rounded corners, falling back to a
+/// refined procedural cover when offline or loading.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_artwork(
     ui: &mut Ui,
@@ -187,14 +187,18 @@ pub fn paint_artwork(
     cache: &mut ArtworkTextureCache,
     commands: &mut Vec<AppCommand>,
 ) {
+    let radius = CornerRadius::same(rounding);
     if let Some(u) = url {
         if let Some(handle) = cache.get(u) {
             let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-            ui.painter().image(handle.id(), rect, uv, Color32::WHITE);
+            ui.painter().add(
+                egui::epaint::RectShape::filled(rect, radius, Color32::WHITE)
+                    .with_texture(handle.id(), uv),
+            );
             ui.painter().rect_stroke(
                 rect,
-                CornerRadius::same(rounding),
-                Stroke::new(1.0, Color32::from_white_alpha(18)),
+                radius,
+                Stroke::new(1.0, Color32::from_white_alpha(20)),
                 StrokeKind::Inside,
             );
             return;
@@ -206,41 +210,41 @@ pub fn paint_artwork(
     let rgb = accent_rgb.unwrap_or_else(|| deterministic_rgb(fallback_seed));
     let base = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
     let dark = Color32::from_rgb(
-        (f32::from(rgb[0]) * 0.28) as u8,
-        (f32::from(rgb[1]) * 0.28) as u8,
-        (f32::from(rgb[2]) * 0.34) as u8,
+        (f32::from(rgb[0]) * 0.24) as u8,
+        (f32::from(rgb[1]) * 0.24) as u8,
+        (f32::from(rgb[2]) * 0.30) as u8,
     );
 
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(rounding), dark);
+    painter.rect_filled(rect, radius, dark);
+
+    // Subtle soft atmospheric highlight clipped inside the artwork frame
+    let clipped = painter.with_clip_rect(rect);
     let glow_center = Pos2::new(
-        rect.left() + rect.width() * 0.32,
-        rect.top() + rect.height() * 0.30,
+        rect.left() + rect.width() * 0.28,
+        rect.top() + rect.height() * 0.26,
     );
-    painter.circle_filled(
+    clipped.circle_filled(
         glow_center,
-        rect.width().min(rect.height()) * 0.44,
-        base.linear_multiply(0.45),
+        rect.width().min(rect.height()) * 0.62,
+        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 88),
     );
-    painter.circle_filled(
+    let vinyl_r = rect.width().min(rect.height()) * 0.24;
+    clipped.circle_filled(rect.center(), vinyl_r, Color32::from_black_alpha(72));
+    clipped.circle_stroke(
         rect.center(),
-        rect.width().min(rect.height()) * 0.22,
-        Color32::from_black_alpha(65),
+        vinyl_r,
+        Stroke::new(1.25, Color32::from_white_alpha(120)),
     );
-    painter.circle_stroke(
+    clipped.circle_filled(
         rect.center(),
-        rect.width().min(rect.height()) * 0.22,
-        Stroke::new(1.5, Color32::from_white_alpha(130)),
-    );
-    painter.circle_filled(
-        rect.center(),
-        rect.width().min(rect.height()) * 0.055,
-        Color32::from_white_alpha(200),
+        (vinyl_r * 0.24).max(2.0),
+        Color32::from_white_alpha(215),
     );
     painter.rect_stroke(
         rect,
-        CornerRadius::same(rounding),
-        Stroke::new(1.0, Color32::from_white_alpha(24)),
+        radius,
+        Stroke::new(1.0, Color32::from_white_alpha(22)),
         StrokeKind::Inside,
     );
 }
@@ -254,6 +258,33 @@ fn blend_opaque(base: Color32, tint: [u8; 3], alpha: f32) -> Color32 {
         (f32::from(base.g()) * inv + f32::from(tint[1]) * a).round() as u8,
         (f32::from(base.b()) * inv + f32::from(tint[2]) * a).round() as u8,
     )
+}
+
+/// Paint a subtle Apple Music-inspired top-edge atmospheric wash tinted by an album/accent color.
+/// Pre-blends into a single opaque mesh so scrolling stays fast with zero alpha overdraw.
+pub fn paint_header_glow(ui: &Ui, rect: Rect, dominant_rgb: [u8; 3], base_bg: Color32, dark: bool) {
+    let strength = if dark { 0.16 } else { 0.11 };
+    let top_left = blend_opaque(base_bg, dominant_rgb, strength);
+    let top_right = blend_opaque(base_bg, dominant_rgb, strength * 0.45);
+    let mid_left = blend_opaque(base_bg, dominant_rgb, strength * 0.35);
+
+    let mut mesh = egui::Mesh::default();
+    let v = |pos: Pos2, color: Color32| egui::epaint::Vertex {
+        pos,
+        uv: Pos2::ZERO,
+        color,
+    };
+    let mid_y = rect.top() + rect.height() * 0.55;
+    mesh.vertices = vec![
+        v(rect.left_top(), top_left),
+        v(rect.right_top(), top_right),
+        v(Pos2::new(rect.left(), mid_y), mid_left),
+        v(Pos2::new(rect.right(), mid_y), base_bg),
+        v(rect.left_bottom(), base_bg),
+        v(rect.right_bottom(), base_bg),
+    ];
+    mesh.indices = vec![0, 1, 2, 1, 3, 2, 2, 3, 4, 3, 5, 4];
+    ui.painter().add(Shape::mesh(mesh));
 }
 
 /// Paint a rich dynamic ambient gradient backdrop tinted by the album's dominant color.
@@ -326,6 +357,26 @@ pub fn artwork_box(
     commands: &mut Vec<AppCommand>,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
+    paint_artwork(ui, rect, rounding, url, seed, accent_rgb, cache, commands);
+    response
+}
+
+/// Allocate and paint a large hero artwork cover with a soft floating elevation shadow.
+#[allow(clippy::too_many_arguments)]
+pub fn artwork_box_shadowed(
+    ui: &mut Ui,
+    size: f32,
+    rounding: u8,
+    shadow: egui::epaint::Shadow,
+    url: Option<&str>,
+    seed: &str,
+    accent_rgb: Option<[u8; 3]>,
+    cache: &mut ArtworkTextureCache,
+    commands: &mut Vec<AppCommand>,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
+    ui.painter()
+        .add(shadow.as_shape(rect, CornerRadius::same(rounding)));
     paint_artwork(ui, rect, rounding, url, seed, accent_rgb, cache, commands);
     response
 }
