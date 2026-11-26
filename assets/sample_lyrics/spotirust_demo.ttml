@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tt xmlns="http://www.w3.org/ns/ttml"
+    xmlns:ttm="http://www.w3.org/ns/ttml#metadata"
+    xmlns:itunes="http://music.apple.com/lyric-ttml-internal"
+    xmlns:amll="http://www.example.com/ns/amll"
+    xml:lang="en"
+    itunes:timing="Word">
+  <head>
+    <metadata>
+      <ttm:title>Midnight Compiler</ttm:title>
+      <ttm:agent type="person" xml:id="v1">
+        <ttm:name type="full">Spotirust Soundcheck</ttm:name>
+      </ttm:agent>
+      <amll:meta key="musicName" value="Midnight Compiler" />
+      <amll:meta key="artists" value="Spotirust Soundcheck" />
+      <amll:meta key="album" value="Native Audio Showcase" />
+      <iTunesMetadata xmlns="http://music.apple.com/lyric-ttml-internal">
+        <translations>
+          <translation xml:lang="vi" type="subtitle">
+            <text for="L1">Sóng âm thuần khiết lướt qua đêm tĩnh lặng</text>
+            <text for="L2">Từng nhịp từng chữ sáng lên đúng khoảnh khắc</text>
+            <text for="L3">Không nặng nề trình duyệt, chỉ có âm nhạc và Rust</text>
+            <text for="L4">Chạm nhẹ thanh tua và lời ca khớp tức thì</text>
+          </translation>
+        </translations>
+      </iTunesMetadata>
+    </metadata>
+  </head>
+  <body>
+    <div itunes:song-part="Verse">
+      <p begin="00:00.500" end="00:04.200" itunes:key="L1" ttm:agent="v1">
+        <span begin="00:00.500" end="00:01.050">Pure</span>
+        <span begin="00:01.050" end="00:01.550">sound</span>
+        <span begin="00:01.550" end="00:02.100">waves</span>
+        <span begin="00:02.100" end="00:02.650">gliding</span>
+        <span begin="00:02.650" end="00:03.100">through</span>
+        <span begin="00:03.100" end="00:03.500">the</span>
+        <span begin="00:03.500" end="00:04.200">quiet night</span>
+      </p>
+      <p begin="00:04.600" end="00:08.500" itunes:key="L2" ttm:agent="v1">
+        <span begin="00:04.600" end="00:05.200">Every</span>
+        <span begin="00:05.200" end="00:05.750">beat</span>
+        <span begin="00:05.750" end="00:06.150">and</span>
+        <span begin="00:06.150" end="00:06.800">syllable</span>
+        <span begin="00:06.800" end="00:07.500">ignites</span>
+        <span begin="00:07.500" end="00:07.850">on</span>
+        <span begin="00:07.850" end="00:08.500">time</span>
+        <span ttm:role="x-bg" begin="00:07.900" end="00:08.500">(right on time)</span>
+      </p>
+    </div>
+    <div itunes:song-part="Chorus">
+      <p begin="00:09.000" end="00:13.400" itunes:key="L3" ttm:agent="v1">
+        <span begin="00:09.000" end="00:09.500">No</span>
+        <span begin="00:09.500" end="00:10.100">heavy</span>
+        <span begin="00:10.100" end="00:10.800">browser</span>
+        <span begin="00:10.800" end="00:11.500">frames,</span>
+        <span begin="00:11.500" end="00:12.000">just</span>
+        <span begin="00:12.000" end="00:12.600">music</span>
+        <span begin="00:12.600" end="00:12.900">and</span>
+        <span begin="00:12.900" end="00:13.400">Rust</span>
+      </p>
+      <p begin="00:13.800" end="00:18.000" itunes:key="L4" ttm:agent="v1">
+        <span begin="00:13.800" end="00:14.400">Scrub</span>
+        <span begin="00:14.400" end="00:14.800">the</span>
+        <span begin="00:14.800" end="00:15.550">timeline</span>
+        <span begin="00:15.550" end="00:16.000">and</span>
+        <span begin="00:16.000" end="00:16.700">every</span>
+        <span begin="00:16.700" end="00:17.200">word</span>
+        <span begin="00:17.200" end="00:18.000">locks in</span>
+      </p>
+    </div>
+  </body>
+</tt>

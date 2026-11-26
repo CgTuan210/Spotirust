@@ -1,0 +1,17 @@
+{
+  "id": "nordic_slate",
+  "name": "Nordic Slate",
+  "dark": true,
+  "bg_base": "#0E1117",
+  "bg_surface": "#161B22",
+  "bg_elevated": "#1F2631",
+  "bg_hover": "#283140",
+  "accent": "#38BDF8",
+  "accent_hover": "#7DD3FC",
+  "text_primary": "#F0F6FC",
+  "text_secondary": "#9CA8B8",
+  "text_muted": "#667486",
+  "border": "#2B3442",
+  "danger": "#F87171",
+  "warning": "#FBBF24"
+}

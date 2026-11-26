@@ -1,0 +1,92 @@
+[package]
+name = "spotirust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Native cross-platform Spotify desktop client written in Rust with word-by-word karaoke lyrics"
+license = "MIT"
+repository = "https://github.com/CgTuan210/Spotirust"
+readme = "README.md"
+keywords = ["spotify", "music", "audio", "egui", "lyrics"]
+categories = ["multimedia::audio", "gui"]
+
+[workspace]
+resolver = "3"
+
+[features]
+default = ["local-audio"]
+# Native local file playback via rodio (MP3, FLAC, Vorbis, WAV)
+local-audio = ["dep:rodio"]
+# Optional community librespot 0.8 streaming backend (requires Spotify Premium; see docs/ARCHITECTURE.md)
+librespot-backend = [
+    "dep:librespot-core",
+    "dep:librespot-playback",
+    "dep:librespot-audio",
+]
+# Optional wgpu renderer instead of lighter OpenGL (glow) renderer
+wgpu-renderer = ["eframe/wgpu"]
+
+[dependencies]
+# Native GUI
+eframe = { version = "0.37.0", default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "default_fonts",
+    "glow",
+    "links",
+    "system_fonts",
+    "wayland",
+    "x11",
+] }
+egui = "0.37.0"
+
+# Async runtime & networking
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "io-util"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset", "json", "form", "query"] }
+async-trait = "0.1"
+
+# Serialization & XML
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+quick-xml = "0.42"
+
+# Persistence & OS secure credential storage
+rusqlite = { version = "0.43", features = ["bundled"] }
+keyring = { version = "4.2", default-features = true }
+dirs = "7.0"
+
+# OAuth PKCE & browser launch
+open = "5.4"
+url = "2.5"
+base64 = "0.23"
+sha2 = "0.11"
+rand = "0.10"
+
+# Audio backends & metadata (rodio 0.21 matches librespot-playback 0.8.0's cpal/alsa-sys graph)
+rodio = { version = "0.21", optional = true, default-features = false, features = ["playback", "flac", "mp3", "vorbis", "wav"] }
+lofty = "0.25"
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal", "wayland"] }
+librespot-core = { version = "0.8.0", optional = true, default-features = false, features = ["rustls-tls-native-roots"] }
+librespot-playback = { version = "0.8.0", optional = true, default-features = false, features = ["rodio-backend", "rustls-tls-native-roots"] }
+librespot-audio = { version = "0.8.0", optional = true, default-features = false, features = ["rustls-tls-native-roots"] }
+
+# Imaging, time, logging & errors
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Native Linux MPRIS2 D-Bus media integration (MIT; zbus is already in the Linux dependency graph)
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

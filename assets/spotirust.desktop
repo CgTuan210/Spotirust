@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Spotirust
+GenericName=Music Player
+Comment=Native Rust Spotify desktop client with word-by-word karaoke lyrics
+Exec=spotirust
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=spotify;music;audio;lyrics;karaoke;rust;
+StartupWMClass=Spotirust

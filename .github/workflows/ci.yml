@@ -1,0 +1,104 @@
+name: CI & Cross-Platform Release Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    name: Format, Clippy, Test & Librespot Check (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install Linux audio & GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev pkg-config libxkbcommon-dev libwayland-dev \
+            libgl1-mesa-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check default features
+        run: cargo check --all-targets
+      - name: Check with optional librespot-backend feature
+        run: cargo check --all-targets --features librespot-backend
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Run Clippy with optional librespot-backend feature
+        run: cargo clippy --all-targets --features librespot-backend -- -D warnings
+      - name: Run unit and integration tests
+        run: cargo test --all-targets
+      - name: Run headless diagnostics benchmark
+        run: cargo run --release -- --diagnostics
+
+  build-matrix:
+    name: Build Release (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x86_64
+            os: ubuntu-24.04
+            archive: spotirust-linux-x86_64-portable.tar.gz
+          - label: macOS ARM64
+            os: macos-latest
+            archive: spotirust-macos-arm64-portable.tar.gz
+          - label: Windows x86_64
+            os: windows-latest
+            archive: spotirust-windows-x86_64-portable.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev pkg-config libxkbcommon-dev libwayland-dev \
+            libgl1-mesa-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Build release binary
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIRUST_CLIENT_ID: ${{ secrets.SPOTIRUST_CLIENT_ID }}
+          SPOTIFY_REDIRECT_URI: ${{ secrets.SPOTIFY_REDIRECT_URI }}
+        run: cargo build --release
+      - name: Verify release binary (Unix)
+        if: runner.os != 'Windows'
+        run: ./target/release/spotirust --diagnostics
+      - name: Verify release binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\target\release\spotirust.exe --diagnostics
+      - name: Package portable bundle (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist/spotirust
+          cp target/release/spotirust dist/spotirust/
+          cp README.md LICENSE dist/spotirust/
+          cp -r assets dist/spotirust/
+          touch dist/spotirust/portable.flag
+          tar -czf "${{ matrix.archive }}" -C dist spotirust
+      - name: Package portable bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\spotirust | Out-Null
+          Copy-Item target\release\spotirust.exe dist\spotirust\
+          Copy-Item README.md, LICENSE dist\spotirust\
+          Copy-Item -Recurse assets dist\spotirust\
+          New-Item -ItemType File -Force -Path dist\spotirust\portable.flag | Out-Null
+          Compress-Archive -Path dist\spotirust\* -DestinationPath "${{ matrix.archive }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
